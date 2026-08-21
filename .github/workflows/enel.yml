@@ -22,6 +22,7 @@ jobs:
         run: |
           cat > monitor.py << 'PYEOF'
           import os, re, sys, time, urllib.parse, urllib.request
+          from collections import Counter
           from datetime import datetime
           from playwright.sync_api import sync_playwright
 
@@ -35,7 +36,7 @@ jobs:
           def avisar(t):
               print(t)
               if not (TG_TOKEN and TG_CHAT_ID):
-                  return
+                  print("faltan secretos"); return
               d = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": t}).encode()
               try:
                   urllib.request.urlopen(urllib.request.Request(
@@ -44,46 +45,13 @@ jobs:
               except Exception as e:
                   print("fallo telegram:", e, file=sys.stderr)
 
-          def volcar(page, titulo):
-              print("=== %s ===" % titulo)
-              for i, s in enumerate(page.query_selector_all("select")):
-                  ops = s.query_selector_all("option")
-                  print("select[%d] id=%s opciones=%d"
-                        % (i, s.get_attribute("id"), len(ops)))
-                  for op in ops:
-                      print("    value=%r texto=%r"
-                            % (op.get_attribute("value"), (op.inner_text() or "").strip()))
-
-          def elegir_texto(page, patron, espera=30):
-              fin = time.time() + espera
-              while time.time() < fin:
-                  for s in page.query_selector_all("select"):
-                      for op in s.query_selector_all("option"):
-                          txt = (op.inner_text() or "").strip()
-                          val = op.get_attribute("value")
-                          if val and re.search(patron, txt, re.I):
-                              s.select_option(val)
-                              return val, txt
-                  page.wait_for_timeout(1000)
-              return None
-
-          def elegir_valor(page, valor):
-              for s in page.query_selector_all("select"):
-                  for op in s.query_selector_all("option"):
-                      if op.get_attribute("value") == valor:
-                          s.select_option(valor)
-                          return True
-              return False
-
           def rgb(v):
               m = re.findall(r"[\d.]+", v or "")
               return tuple(int(float(x)) for x in m[:3]) if len(m) >= 3 else None
 
-          def verde(c):
-              if not c:
-                  return False
+          def gris(c):
               r, g, b = c
-              return True
+              return abs(r - g) < 14 and abs(g - b) < 14 and abs(r - b) < 14
 
           JS_CELDAS = """() => {
             const out = [];
@@ -92,17 +60,27 @@ jobs:
               if (!/^\\d{1,2}$/.test(t)) return;
               if (el.children.length > 1) return;
               const cs = getComputedStyle(el);
-              out.push({dia: t, bg: cs.backgroundColor,
-                        bgp: getComputedStyle(el.parentElement || el).backgroundColor});
+              let bg = cs.backgroundColor;
+              if (!bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') {
+                bg = getComputedStyle(el.parentElement || el).backgroundColor;
+              }
+              out.push({dia: t, bg: bg});
             });
             return out;
           }"""
 
           JS_MES = """() => {
-            const el = [...document.querySelectorAll('*')].find(e =>
-              /^(Enero|Febrero|Marzo|Abril|Mayo|Junio|Julio|Agosto|Septiembre|Octubre|Noviembre|Diciembre)\\s+\\d{4}$/i
-              .test((e.innerText||'').trim()) && e.children.length === 0);
-            return el ? el.innerText.trim() : 'mes?';
+            const meses = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio',
+                           'Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+            const rx = new RegExp('(' + meses.join('|') + ')\\\\s*(de\\\\s*)?\\\\d{4}', 'i');
+            const cands = [...document.querySelectorAll('*')]
+              .filter(e => e.children.length === 0)
+              .map(e => (e.innerText || '').trim())
+              .filter(t => rx.test(t));
+            if (cands.length) return rx.exec(cands[0])[0];
+            const body = document.body.innerText || '';
+            const m = rx.exec(body);
+            return m ? m[0] : 'mes desconocido';
           }"""
 
           def avanzar(page):
@@ -110,7 +88,7 @@ jobs:
                         "[title*='Sig' i]", "[class*='next' i]", "[id*='next' i]"]:
                   el = page.query_selector(s)
                   if el and el.is_visible():
-                      el.click(); page.wait_for_timeout(2000); return True
+                      el.click(); page.wait_for_timeout(2500); return True
               return False
 
           def continuar(page):
@@ -120,6 +98,41 @@ jobs:
                       b.click(); return True
               return False
 
+          def elegir_texto(page, patron, espera=30):
+              fin = time.time() + espera
+              while time.time() < fin:
+                  for s in page.query_selector_all("select"):
+                      for op in s.query_selector_all("option"):
+                          txt = (op.inner_text() or "").strip()
+                          val = op.get_attribute("value")
+                          if val and re.search(patron, txt, re.I):
+                              s.select_option(val); return val, txt
+                  page.wait_for_timeout(1000)
+              return None
+
+          def elegir_valor(page, valor):
+              for s in page.query_selector_all("select"):
+                  for op in s.query_selector_all("option"):
+                      if op.get_attribute("value") == valor:
+                          s.select_option(valor); return True
+              return False
+
+          def anomalas(celdas):
+              """Devuelve los dias cuyo color se sale del patron dominante."""
+              colores = [rgb(c["bg"]) for c in celdas]
+              validos = [c for c in colores if c]
+              if not validos:
+                  return []
+              dominante = Counter(validos).most_common(1)[0][0]
+              fuera = []
+              for c, col in zip(celdas, colores):
+                  if not col or col == dominante:
+                      continue
+                  if gris(col):
+                      continue
+                  fuera.append((c["dia"], col))
+              return fuera
+
           with sync_playwright() as p:
               nav = p.chromium.launch()
               page = nav.new_page(viewport={"width": 1280, "height": 1400})
@@ -127,10 +140,8 @@ jobs:
               try:
                   page.goto(URL, wait_until="networkidle")
                   page.wait_for_timeout(5000)
-
                   if not elegir_texto(page, OFICINA):
-                      volcar(page, "NO SE ENCONTRO LA OFICINA")
-                      sys.exit(1)
+                      print("no se encontro la oficina"); sys.exit(1)
                   page.wait_for_timeout(4000)
 
                   lista = []
@@ -144,12 +155,9 @@ jobs:
                                   lista.append((v, t))
                       if not lista:
                           page.wait_for_timeout(1000)
-
                   if not lista:
-                      volcar(page, "NO HAY TRAMITES CON 'EMPALME'")
-                      sys.exit(1)
-
-                  print("tramites detectados:", lista)
+                      print("sin tramites de empalme"); sys.exit(1)
+                  print("tramites:", [t for _, t in lista])
 
                   for valor, etiqueta in lista:
                       page.goto(URL, wait_until="networkidle")
@@ -165,10 +173,12 @@ jobs:
                       for _ in range(MESES):
                           mes = page.evaluate(JS_MES)
                           celdas = page.evaluate(JS_CELDAS)
-                          print("%s | %s | %d celdas" % (etiqueta, mes, len(celdas)))
-                          for c in celdas:
-                              if verde(rgb(c["bg"]) or rgb(c["bgp"])):
-                                  hall.append("%s | %s %s" % (etiqueta, c["dia"], mes))
+                          raros = anomalas(celdas)
+                          print("%s | %s | %d celdas | %d fuera de patron"
+                                % (etiqueta, mes, len(celdas), len(raros)))
+                          for dia, col in raros:
+                              print("    dia %s color %s" % (dia, col))
+                              hall.append("%s -> %s de %s" % (etiqueta, dia, mes))
                           if not avanzar(page):
                               break
               finally:
@@ -176,10 +186,10 @@ jobs:
 
           ts = datetime.now().strftime("%d-%m-%Y %H:%M UTC")
           if hall:
-              avisar("CUPOS ENEL PROVIDENCIA (%s)\n%s\n\n%s"
-                     % (ts, "\n".join(hall[:25]), URL))
+              avisar("HAY DIAS DISPONIBLES - ENEL PROVIDENCIA\n(%s)\n\n%s\n\n%s"
+                     % (ts, "\n".join(hall[:30]), URL))
           else:
-              print(ts, "- sin cupos")
+              print(ts, "- sin dias marcados")
           PYEOF
 
       - name: Revisar disponibilidad
