@@ -83,7 +83,7 @@ jobs:
               if not c:
                   return False
               r, g, b = c
-              return g > r + 25 and g > b + 25
+              return True
 
           JS_CELDAS = """() => {
             const out = [];
