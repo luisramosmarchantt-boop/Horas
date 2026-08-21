@@ -1,0 +1,143 @@
+name: monitor-enel
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Escribir monitor
+        run: |
+          cat > monitor.py << 'PYEOF'
+          import os, re, sys, urllib.parse, urllib.request
+          from datetime import datetime
+          from playwright.sync_api import sync_playwright
+
+          URL = "https://servicequendalat.enel.com/citaprevia/?pais=cl"
+          OFICINA = "CLRM004"
+          PATRON = r"empalme"
+          MESES = 3
+          TG_TOKEN = os.environ.get("TG_TOKEN", "")
+          TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+
+          def avisar(t):
+              print(t)
+              if not (TG_TOKEN and TG_CHAT_ID):
+                  return
+              d = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": t}).encode()
+              try:
+                  urllib.request.urlopen(urllib.request.Request(
+                      "https://api.telegram.org/bot%s/sendMessage" % TG_TOKEN,
+                      data=d), timeout=20).read()
+              except Exception as e:
+                  print("fallo telegram:", e, file=sys.stderr)
+
+          def rgb(v):
+              m = re.findall(r"[\d.]+", v or "")
+              return tuple(int(float(x)) for x in m[:3]) if len(m) >= 3 else None
+
+          def verde(c):
+              if not c:
+                  return False
+              r, g, b = c
+              return g > r + 25 and g > b + 25
+
+          JS_CELDAS = """() => {
+            const out = [];
+            document.querySelectorAll('td, div').forEach(el => {
+              const t = (el.innerText || '').trim();
+              if (!/^\\d{1,2}$/.test(t)) return;
+              if (el.children.length > 1) return;
+              const cs = getComputedStyle(el);
+              out.push({dia: t, bg: cs.backgroundColor,
+                        bgp: getComputedStyle(el.parentElement || el).backgroundColor});
+            });
+            return out;
+          }"""
+
+          JS_MES = """() => {
+            const el = [...document.querySelectorAll('*')].find(e =>
+              /^(Enero|Febrero|Marzo|Abril|Mayo|Junio|Julio|Agosto|Septiembre|Octubre|Noviembre|Diciembre)\\s+\\d{4}$/i
+              .test((e.innerText||'').trim()) && e.children.length === 0);
+            return el ? el.innerText.trim() : 'mes?';
+          }"""
+
+          def avanzar(page):
+              for s in ["a.ui-datepicker-next", ".ui-datepicker-next",
+                        "[title*='Sig' i]", "[class*='next' i]", "[id*='next' i]"]:
+                  el = page.query_selector(s)
+                  if el and el.is_visible():
+                      el.click(); page.wait_for_timeout(2000); return True
+              return False
+
+          def tramites(page):
+              page.goto(URL, wait_until="networkidle"); page.wait_for_timeout(4000)
+              page.query_selector_all("select")[0].select_option(OFICINA)
+              page.wait_for_timeout(3000)
+              r = []
+              for s in page.query_selector_all("select")[1:]:
+                  for op in s.query_selector_all("option"):
+                      v, t = op.get_attribute("value"), op.inner_text().strip()
+                      if v and re.search(PATRON, t, re.I):
+                          r.append((v, t))
+              return r
+
+          def paso2(page, valor):
+              page.goto(URL, wait_until="networkidle"); page.wait_for_timeout(4000)
+              page.query_selector_all("select")[0].select_option(OFICINA)
+              page.wait_for_timeout(3000)
+              for s in page.query_selector_all("select")[1:]:
+                  try:
+                      s.select_option(valor); break
+                  except Exception:
+                      continue
+              page.wait_for_timeout(2000)
+              b = page.query_selector("text=Continuar")
+              if b: b.click()
+              page.wait_for_timeout(4000)
+
+          with sync_playwright() as p:
+              nav = p.chromium.launch()
+              page = nav.new_page(viewport={"width": 1280, "height": 1400})
+              hall = []
+              try:
+                  lista = tramites(page)
+                  if not lista:
+                      print("sin tramites de empalme"); sys.exit(0)
+                  for valor, etiqueta in lista:
+                      paso2(page, valor)
+                      for _ in range(MESES):
+                          mes = page.evaluate(JS_MES)
+                          for c in page.evaluate(JS_CELDAS):
+                              if verde(rgb(c["bg"]) or rgb(c["bgp"])):
+                                  hall.append("%s | %s %s" % (etiqueta, c["dia"], mes))
+                          if not avanzar(page):
+                              break
+              finally:
+                  nav.close()
+
+          ts = datetime.now().strftime("%d-%m-%Y %H:%M UTC")
+          if hall:
+              avisar("CUPOS ENEL PROVIDENCIA (%s)\n%s\n\n%s"
+                     % (ts, "\n".join(hall[:25]), URL))
+          else:
+              print(ts, "- sin cupos")
+          PYEOF
+
+      - name: Revisar disponibilidad
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python monitor.py
