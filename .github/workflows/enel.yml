@@ -19,12 +19,14 @@ jobs:
       - name: Escribir diagnostico
         run: |
           cat > diag.py << 'PYEOF'
-          import re, sys, time
+          import re, sys, time, json
           from playwright.sync_api import sync_playwright
 
           URL = "https://servicequendalat.enel.com/citaprevia/?pais=cl"
           OFICINA = r"PROVIDENCIA"
           PATRON = r"empalme"
+
+          red = []
 
           def elegir_texto(page, patron, espera=30):
               fin = time.time() + espera
@@ -45,56 +47,42 @@ jobs:
                       b.click(); return True
               return False
 
-          JS_DUMP = """() => {
+          JS_CELDAS = """() => {
             const out = [];
-            document.querySelectorAll('td, div, span, a, button, li').forEach(el => {
-              const t = (el.innerText || '').trim();
+            document.querySelectorAll('.ui-datepicker-calendar td').forEach(td => {
+              const t = (td.innerText || '').trim();
               if (!/^\\d{1,2}$/.test(t)) return;
-              if (el.querySelectorAll('*').length > 2) return;
-              const cs = getComputedStyle(el);
-              const attrs = {};
-              for (const a of el.attributes) attrs[a.name] = a.value;
               out.push({
                 dia: t,
-                tag: el.tagName,
-                attrs: attrs,
-                cls: el.className && el.className.toString(),
-                padreTag: el.parentElement ? el.parentElement.tagName : null,
-                padreCls: el.parentElement ? (el.parentElement.className||'').toString() : null,
-                padreAttrs: el.parentElement ? [...el.parentElement.attributes].map(a=>a.name+'='+a.value).join(' ') : null,
-                bg: cs.backgroundColor,
-                color: cs.color,
-                cursor: cs.cursor,
-                opacity: cs.opacity,
-                pe: cs.pointerEvents,
-                hijos: el.innerHTML.slice(0, 200),
-                disabled: el.disabled === true || el.getAttribute('aria-disabled')
+                cls: td.className.trim(),
+                hijo: td.firstElementChild ? td.firstElementChild.tagName : null,
+                link: !!td.querySelector('a')
               });
             });
             return out;
           }"""
 
-          JS_CONTENEDOR = """() => {
-            // el ancestro comun mas cercano que contenga al menos 20 numeros de dia
-            const nums = [...document.querySelectorAll('*')].filter(e => {
-              const t = (e.innerText||'').trim();
-              return /^\\d{1,2}$/.test(t) && e.querySelectorAll('*').length <= 2;
-            });
-            if (!nums.length) return 'sin celdas';
-            let p = nums[0];
-            for (let i = 0; i < 6 && p.parentElement; i++) p = p.parentElement;
-            return p.outerHTML.slice(0, 6000);
+          JS_MES = """() => {
+            const m = document.querySelector('.ui-datepicker-month');
+            const y = document.querySelector('.ui-datepicker-year');
+            return (m ? m.innerText : '?') + ' ' + (y ? y.innerText : '?');
+          }"""
+
+          JS_DERECHA = """() => {
+            const d = document.querySelector('#columnaDerecha') ||
+                      document.querySelector('.column:not(.calendario)');
+            return d ? d.innerHTML.slice(0, 2500) : 'sin columna derecha';
           }"""
 
           with sync_playwright() as p:
               nav = p.chromium.launch()
               page = nav.new_page(viewport={"width": 1280, "height": 1400})
+              page.on("request", lambda r: red.append((r.method, r.url, (r.post_data or "")[:300]))
+                      if r.resource_type in ("xhr", "fetch", "document") else None)
               try:
                   page.goto(URL, wait_until="networkidle")
                   page.wait_for_timeout(5000)
-                  print("=== TITULO:", page.title())
-                  if not elegir_texto(page, OFICINA):
-                      print("no se encontro la oficina"); print(page.content()[:4000]); sys.exit(1)
+                  elegir_texto(page, OFICINA)
                   page.wait_for_timeout(4000)
 
                   lista = []
@@ -108,44 +96,63 @@ jobs:
                                   lista.append((v, t))
                       if not lista:
                           page.wait_for_timeout(1000)
-                  print("=== TRAMITES:", [t for _, t in lista])
-                  if not lista: sys.exit(1)
+                  print("=== TRAMITES:", json.dumps(lista, ensure_ascii=False))
 
-                  valor, etiqueta = lista[0]
-                  for s in page.query_selector_all("select"):
-                      for op in s.query_selector_all("option"):
-                          if op.get_attribute("value") == valor:
-                              s.select_option(valor)
-                  page.wait_for_timeout(2000)
-                  continuar(page)
-                  page.wait_for_timeout(6000)
+                  for valor, etiqueta in lista:
+                      page.goto(URL, wait_until="networkidle")
+                      page.wait_for_timeout(5000)
+                      elegir_texto(page, OFICINA)
+                      page.wait_for_timeout(4000)
+                      ok = False
+                      for s in page.query_selector_all("select"):
+                          for op in s.query_selector_all("option"):
+                              if op.get_attribute("value") == valor:
+                                  s.select_option(valor); ok = True
+                      if not ok:
+                          print("!! no pude seleccionar", etiqueta); continue
+                      page.wait_for_timeout(2000)
+                      continuar(page)
+                      page.wait_for_timeout(6000)
 
-                  print("=== TRAMITE ELEGIDO:", etiqueta)
-                  print("=== TEXTO PAGINA ===")
-                  print((page.inner_text("body") or "")[:3000])
-                  print("=== CONTENEDOR CALENDARIO ===")
-                  print(page.evaluate(JS_CONTENEDOR))
-                  print("=== CELDAS ===")
-                  for c in page.evaluate(JS_DUMP):
-                      print(c)
-                  print("=== BOTONES/LINKS VISIBLES ===")
-                  for el in page.query_selector_all("a, button"):
-                      try:
-                          if el.is_visible():
-                              print(repr((el.inner_text() or "").strip()[:60]),
-                                    el.get_attribute("class"), el.get_attribute("title"))
-                      except Exception:
-                          pass
+                      for _ in range(4):
+                          mes = page.evaluate(JS_MES)
+                          celdas = page.evaluate(JS_CELDAS)
+                          clases = {}
+                          libres = []
+                          for c in celdas:
+                              k = c["cls"]
+                              clases[k] = clases.get(k, 0) + 1
+                              if "unselectable" not in k and "ui-state-disabled" not in k:
+                                  libres.append(c)
+                          print("--- %s | %s | %d celdas" % (etiqueta[:40], mes, len(celdas)))
+                          for k, n in clases.items():
+                              print("     x%-2d  %s" % (n, k))
+                          if libres:
+                              print("     LIBRES:", libres)
+                              d = libres[0]["dia"]
+                              try:
+                                  page.click(".ui-datepicker-calendar td:not(.ui-state-disabled) a")
+                                  page.wait_for_timeout(5000)
+                                  print("     TRAS CLICK dia %s:" % d)
+                                  print("     TEXTO:", (page.inner_text("body") or "")[:1200].replace("\n", " | "))
+                                  print("     DERECHA:", page.evaluate(JS_DERECHA))
+                              except Exception as e:
+                                  print("     fallo click:", e)
+                          nxt = page.query_selector("a.ui-datepicker-next")
+                          if not nxt or not nxt.is_visible():
+                              break
+                          nxt.click(); page.wait_for_timeout(2500)
               finally:
-                  page.screenshot(path="cal.png", full_page=True)
                   nav.close()
+
+          print("=== RED (xhr/fetch/document) ===")
+          vistos = set()
+          for m, u, d in red:
+              k = (m, u.split("?")[0])
+              if k in vistos and not d: continue
+              vistos.add(k)
+              print(m, u[:220], "| POST:", d)
           PYEOF
 
       - name: Ejecutar diagnostico
         run: python diag.py
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: captura
-          path: cal.png
