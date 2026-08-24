@@ -4,155 +4,66 @@ on:
   workflow_dispatch:
 
 jobs:
-  diag:
+  sonda:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Instalar Playwright
+      - name: Escribir sonda
         run: |
-          pip install playwright
-          playwright install --with-deps chromium
+          cat > sonda.py << 'PYEOF'
+          import re, http.cookiejar, urllib.request, urllib.parse
+          from datetime import date
 
-      - name: Escribir diagnostico
-        run: |
-          cat > diag.py << 'PYEOF'
-          import re, sys, time, json
-          from playwright.sync_api import sync_playwright
+          BASE = "https://servicequendalat.enel.com/citaprevia"
+          tarro = http.cookiejar.CookieJar()
+          ab = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(tarro))
+          ab.addheaders = [("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+                           ("Accept-Language", "es-CL,es;q=0.9")]
 
-          URL = "https://servicequendalat.enel.com/citaprevia/?pais=cl"
-          OFICINA = r"PROVIDENCIA"
-          PATRON = r"empalme"
+          def traer(url):
+              with ab.open(url, timeout=30) as r:
+                  return r.status, r.read().decode("utf-8", "replace")
 
-          red = []
+          st, home = traer(BASE + "/?pais=cl")
+          print("HOME:", st, len(home), "cookies:", [c.name for c in tarro])
 
-          def elegir_texto(page, patron, espera=30):
-              fin = time.time() + espera
-              while time.time() < fin:
-                  for s in page.query_selector_all("select"):
-                      for op in s.query_selector_all("option"):
-                          txt = (op.inner_text() or "").strip()
-                          val = op.get_attribute("value")
-                          if val and re.search(patron, txt, re.I):
-                              s.select_option(val); return val, txt
-                  page.wait_for_timeout(1000)
-              return None
+          # oficinas desde el select del home
+          sel = re.search(r'<select[^>]*[Oo]ficina[^>]*>(.*?)</select>', home, re.S)
+          if not sel:
+              sels = re.findall(r'<select.*?</select>', home, re.S)
+              print("selects encontrados:", len(sels))
+              for s in sels[:3]:
+                  print("   ", s[:300].replace("\n", " "))
+          else:
+              ops = re.findall(r'<option[^>]*value="([^"]*)"[^>]*>([^<]*)</option>', sel.group(1))
+              print("OFICINAS (primeras 8):", ops[:8])
+              prov = [o for o in ops if re.search("PROVIDENCIA", o[1], re.I)]
+              print("PROVIDENCIA ->", prov)
 
-          def continuar(page):
-              for t in ["Continuar", "Siguiente", "Aceptar"]:
-                  b = page.query_selector("text=%s" % t)
-                  if b and b.is_visible():
-                      b.click(); return True
-              return False
+          for idof in ("24",):
+              st, cs = traer("%s/cita/comboServicios?idOficina=%s&codServicio=&idioma=" % (BASE, idof))
+              print("COMBO oficina %s: %s %d bytes" % (idof, st, len(cs)))
+              print("   crudo:", cs[:600].replace("\n", " "))
+              serv = re.findall(r'value="(\d+)"[^>]*>([^<]+)<', cs)
+              print("   servicios:", serv[:10])
 
-          JS_CELDAS = """() => {
-            const out = [];
-            document.querySelectorAll('.ui-datepicker-calendar td').forEach(td => {
-              const t = (td.innerText || '').trim();
-              if (!/^\\d{1,2}$/.test(t)) return;
-              out.push({
-                dia: t,
-                cls: td.className.trim(),
-                hijo: td.firstElementChild ? td.firstElementChild.tagName : null,
-                link: !!td.querySelector('a')
-              });
-            });
-            return out;
-          }"""
-
-          JS_MES = """() => {
-            const m = document.querySelector('.ui-datepicker-month');
-            const y = document.querySelector('.ui-datepicker-year');
-            return (m ? m.innerText : '?') + ' ' + (y ? y.innerText : '?');
-          }"""
-
-          JS_DERECHA = """() => {
-            const d = document.querySelector('#columnaDerecha') ||
-                      document.querySelector('.column:not(.calendario)');
-            return d ? d.innerHTML.slice(0, 2500) : 'sin columna derecha';
-          }"""
-
-          with sync_playwright() as p:
-              nav = p.chromium.launch()
-              page = nav.new_page(viewport={"width": 1280, "height": 1400})
-              page.on("request", lambda r: red.append((r.method, r.url, (r.post_data or "")[:300]))
-                      if r.resource_type in ("xhr", "fetch", "document") else None)
-              try:
-                  page.goto(URL, wait_until="networkidle")
-                  page.wait_for_timeout(5000)
-                  elegir_texto(page, OFICINA)
-                  page.wait_for_timeout(4000)
-
-                  lista = []
-                  fin = time.time() + 20
-                  while time.time() < fin and not lista:
-                      for s in page.query_selector_all("select"):
-                          for op in s.query_selector_all("option"):
-                              v = op.get_attribute("value")
-                              t = (op.inner_text() or "").strip()
-                              if v and re.search(PATRON, t, re.I):
-                                  lista.append((v, t))
-                      if not lista:
-                          page.wait_for_timeout(1000)
-                  print("=== TRAMITES:", json.dumps(lista, ensure_ascii=False))
-
-                  for valor, etiqueta in lista:
-                      page.goto(URL, wait_until="networkidle")
-                      page.wait_for_timeout(5000)
-                      elegir_texto(page, OFICINA)
-                      page.wait_for_timeout(4000)
-                      ok = False
-                      for s in page.query_selector_all("select"):
-                          for op in s.query_selector_all("option"):
-                              if op.get_attribute("value") == valor:
-                                  s.select_option(valor); ok = True
-                      if not ok:
-                          print("!! no pude seleccionar", etiqueta); continue
-                      page.wait_for_timeout(2000)
-                      continuar(page)
-                      page.wait_for_timeout(6000)
-
-                      for _ in range(4):
-                          mes = page.evaluate(JS_MES)
-                          celdas = page.evaluate(JS_CELDAS)
-                          clases = {}
-                          libres = []
-                          for c in celdas:
-                              k = c["cls"]
-                              clases[k] = clases.get(k, 0) + 1
-                              if "unselectable" not in k and "ui-state-disabled" not in k:
-                                  libres.append(c)
-                          print("--- %s | %s | %d celdas" % (etiqueta[:40], mes, len(celdas)))
-                          for k, n in clases.items():
-                              print("     x%-2d  %s" % (n, k))
-                          if libres:
-                              print("     LIBRES:", libres)
-                              d = libres[0]["dia"]
-                              try:
-                                  page.click(".ui-datepicker-calendar td:not(.ui-state-disabled) a")
-                                  page.wait_for_timeout(5000)
-                                  print("     TRAS CLICK dia %s:" % d)
-                                  print("     TEXTO:", (page.inner_text("body") or "")[:1200].replace("\n", " | "))
-                                  print("     DERECHA:", page.evaluate(JS_DERECHA))
-                              except Exception as e:
-                                  print("     fallo click:", e)
-                          nxt = page.query_selector("a.ui-datepicker-next")
-                          if not nxt or not nxt.is_visible():
-                              break
-                          nxt.click(); page.wait_for_timeout(2500)
-              finally:
-                  nav.close()
-
-          print("=== RED (xhr/fetch/document) ===")
-          vistos = set()
-          for m, u, d in red:
-              k = (m, u.split("?")[0])
-              if k in vistos and not d: continue
-              vistos.add(k)
-              print(m, u[:220], "| POST:", d)
+          hoy = date.today().isoformat()
+          for f in (hoy, "2026-09-01", "2026-09-02", "2026-09-03"):
+              st, cal = traer("%s/cita/calendarioServicio?idServicio=11443&fecha=%s"
+                              "&grupoMaestroRaiz=1&idOficina=24" % (BASE, f))
+              libres = re.findall(r'<td[^>]*class="([^"]*diaLibre[^"]*)"[^>]*>.*?>(\d{1,2})<', cal)
+              disp = re.findall(r'Disponible\((\d+)\)', cal)
+              horas = re.findall(r'\b([01]?\d|2[0-3]):[0-5]\d\b', cal)
+              print("CAL %s: %s %d bytes | diaLibre=%s | Disponible=%s | horas=%d"
+                    % (f, st, len(cal), libres, disp[:12], len(horas)))
+              if f == "2026-09-02":
+                  i = cal.find("Disponible")
+                  print("   trozo:", cal[max(0, i-700):i+700].replace("\n", " ")[:1400])
           PYEOF
 
-      - name: Ejecutar diagnostico
-        run: python diag.py
+      - name: Probar API
+        run: python sonda.py
