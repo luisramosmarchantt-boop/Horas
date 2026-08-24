@@ -1,12 +1,10 @@
 name: monitor-enel
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
-  check:
+  diag:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
@@ -18,85 +16,15 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
-      - name: Escribir monitor
+      - name: Escribir diagnostico
         run: |
-          cat > monitor.py << 'PYEOF'
-          import os, re, sys, time, urllib.parse, urllib.request
-          from collections import Counter
-          from datetime import datetime
+          cat > diag.py << 'PYEOF'
+          import re, sys, time
           from playwright.sync_api import sync_playwright
 
           URL = "https://servicequendalat.enel.com/citaprevia/?pais=cl"
           OFICINA = r"PROVIDENCIA"
           PATRON = r"empalme"
-          MESES = 3
-          TG_TOKEN = os.environ.get("TG_TOKEN", "")
-          TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-
-          def avisar(t):
-              print(t)
-              if not (TG_TOKEN and TG_CHAT_ID):
-                  print("faltan secretos"); return
-              d = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": t}).encode()
-              try:
-                  urllib.request.urlopen(urllib.request.Request(
-                      "https://api.telegram.org/bot%s/sendMessage" % TG_TOKEN,
-                      data=d), timeout=20).read()
-              except Exception as e:
-                  print("fallo telegram:", e, file=sys.stderr)
-
-          def rgb(v):
-              m = re.findall(r"[\d.]+", v or "")
-              return tuple(int(float(x)) for x in m[:3]) if len(m) >= 3 else None
-
-          def gris(c):
-              r, g, b = c
-              return abs(r - g) < 14 and abs(g - b) < 14 and abs(r - b) < 14
-
-          JS_CELDAS = """() => {
-            const out = [];
-            document.querySelectorAll('td, div').forEach(el => {
-              const t = (el.innerText || '').trim();
-              if (!/^\\d{1,2}$/.test(t)) return;
-              if (el.children.length > 1) return;
-              const cs = getComputedStyle(el);
-              let bg = cs.backgroundColor;
-              if (!bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') {
-                bg = getComputedStyle(el.parentElement || el).backgroundColor;
-              }
-              out.push({dia: t, bg: bg});
-            });
-            return out;
-          }"""
-
-          JS_MES = """() => {
-            const meses = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio',
-                           'Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
-            const rx = new RegExp('(' + meses.join('|') + ')\\\\s*(de\\\\s*)?\\\\d{4}', 'i');
-            const cands = [...document.querySelectorAll('*')]
-              .filter(e => e.children.length === 0)
-              .map(e => (e.innerText || '').trim())
-              .filter(t => rx.test(t));
-            if (cands.length) return rx.exec(cands[0])[0];
-            const body = document.body.innerText || '';
-            const m = rx.exec(body);
-            return m ? m[0] : 'mes desconocido';
-          }"""
-
-          def avanzar(page):
-              for s in ["a.ui-datepicker-next", ".ui-datepicker-next",
-                        "[title*='Sig' i]", "[class*='next' i]", "[id*='next' i]"]:
-                  el = page.query_selector(s)
-                  if el and el.is_visible():
-                      el.click(); page.wait_for_timeout(2500); return True
-              return False
-
-          def continuar(page):
-              for t in ["Continuar", "Siguiente", "Aceptar"]:
-                  b = page.query_selector("text=%s" % t)
-                  if b and b.is_visible():
-                      b.click(); return True
-              return False
 
           def elegir_texto(page, patron, espera=30):
               fin = time.time() + espera
@@ -110,38 +38,63 @@ jobs:
                   page.wait_for_timeout(1000)
               return None
 
-          def elegir_valor(page, valor):
-              for s in page.query_selector_all("select"):
-                  for op in s.query_selector_all("option"):
-                      if op.get_attribute("value") == valor:
-                          s.select_option(valor); return True
+          def continuar(page):
+              for t in ["Continuar", "Siguiente", "Aceptar"]:
+                  b = page.query_selector("text=%s" % t)
+                  if b and b.is_visible():
+                      b.click(); return True
               return False
 
-          def anomalas(celdas):
-              """Devuelve los dias cuyo color se sale del patron dominante."""
-              colores = [rgb(c["bg"]) for c in celdas]
-              validos = [c for c in colores if c]
-              if not validos:
-                  return []
-              dominante = Counter(validos).most_common(1)[0][0]
-              fuera = []
-              for c, col in zip(celdas, colores):
-                  if not col or col == dominante:
-                      continue
-                  if gris(col):
-                      continue
-                  fuera.append((c["dia"], col))
-              return fuera
+          JS_DUMP = """() => {
+            const out = [];
+            document.querySelectorAll('td, div, span, a, button, li').forEach(el => {
+              const t = (el.innerText || '').trim();
+              if (!/^\\d{1,2}$/.test(t)) return;
+              if (el.querySelectorAll('*').length > 2) return;
+              const cs = getComputedStyle(el);
+              const attrs = {};
+              for (const a of el.attributes) attrs[a.name] = a.value;
+              out.push({
+                dia: t,
+                tag: el.tagName,
+                attrs: attrs,
+                cls: el.className && el.className.toString(),
+                padreTag: el.parentElement ? el.parentElement.tagName : null,
+                padreCls: el.parentElement ? (el.parentElement.className||'').toString() : null,
+                padreAttrs: el.parentElement ? [...el.parentElement.attributes].map(a=>a.name+'='+a.value).join(' ') : null,
+                bg: cs.backgroundColor,
+                color: cs.color,
+                cursor: cs.cursor,
+                opacity: cs.opacity,
+                pe: cs.pointerEvents,
+                hijos: el.innerHTML.slice(0, 200),
+                disabled: el.disabled === true || el.getAttribute('aria-disabled')
+              });
+            });
+            return out;
+          }"""
+
+          JS_CONTENEDOR = """() => {
+            // el ancestro comun mas cercano que contenga al menos 20 numeros de dia
+            const nums = [...document.querySelectorAll('*')].filter(e => {
+              const t = (e.innerText||'').trim();
+              return /^\\d{1,2}$/.test(t) && e.querySelectorAll('*').length <= 2;
+            });
+            if (!nums.length) return 'sin celdas';
+            let p = nums[0];
+            for (let i = 0; i < 6 && p.parentElement; i++) p = p.parentElement;
+            return p.outerHTML.slice(0, 6000);
+          }"""
 
           with sync_playwright() as p:
               nav = p.chromium.launch()
               page = nav.new_page(viewport={"width": 1280, "height": 1400})
-              hall = []
               try:
                   page.goto(URL, wait_until="networkidle")
                   page.wait_for_timeout(5000)
+                  print("=== TITULO:", page.title())
                   if not elegir_texto(page, OFICINA):
-                      print("no se encontro la oficina"); sys.exit(1)
+                      print("no se encontro la oficina"); print(page.content()[:4000]); sys.exit(1)
                   page.wait_for_timeout(4000)
 
                   lista = []
@@ -155,45 +108,44 @@ jobs:
                                   lista.append((v, t))
                       if not lista:
                           page.wait_for_timeout(1000)
-                  if not lista:
-                      print("sin tramites de empalme"); sys.exit(1)
-                  print("tramites:", [t for _, t in lista])
+                  print("=== TRAMITES:", [t for _, t in lista])
+                  if not lista: sys.exit(1)
 
-                  for valor, etiqueta in lista:
-                      page.goto(URL, wait_until="networkidle")
-                      page.wait_for_timeout(5000)
-                      elegir_texto(page, OFICINA)
-                      page.wait_for_timeout(4000)
-                      if not elegir_valor(page, valor):
-                          print("no pude seleccionar", etiqueta); continue
-                      page.wait_for_timeout(2000)
-                      continuar(page)
-                      page.wait_for_timeout(5000)
+                  valor, etiqueta = lista[0]
+                  for s in page.query_selector_all("select"):
+                      for op in s.query_selector_all("option"):
+                          if op.get_attribute("value") == valor:
+                              s.select_option(valor)
+                  page.wait_for_timeout(2000)
+                  continuar(page)
+                  page.wait_for_timeout(6000)
 
-                      for _ in range(MESES):
-                          mes = page.evaluate(JS_MES)
-                          celdas = page.evaluate(JS_CELDAS)
-                          raros = anomalas(celdas)
-                          print("%s | %s | %d celdas | %d fuera de patron"
-                                % (etiqueta, mes, len(celdas), len(raros)))
-                          for dia, col in raros:
-                              print("    dia %s color %s" % (dia, col))
-                              hall.append("%s -> %s de %s" % (etiqueta, dia, mes))
-                          if not avanzar(page):
-                              break
+                  print("=== TRAMITE ELEGIDO:", etiqueta)
+                  print("=== TEXTO PAGINA ===")
+                  print((page.inner_text("body") or "")[:3000])
+                  print("=== CONTENEDOR CALENDARIO ===")
+                  print(page.evaluate(JS_CONTENEDOR))
+                  print("=== CELDAS ===")
+                  for c in page.evaluate(JS_DUMP):
+                      print(c)
+                  print("=== BOTONES/LINKS VISIBLES ===")
+                  for el in page.query_selector_all("a, button"):
+                      try:
+                          if el.is_visible():
+                              print(repr((el.inner_text() or "").strip()[:60]),
+                                    el.get_attribute("class"), el.get_attribute("title"))
+                      except Exception:
+                          pass
               finally:
+                  page.screenshot(path="cal.png", full_page=True)
                   nav.close()
-
-          ts = datetime.now().strftime("%d-%m-%Y %H:%M UTC")
-          if hall:
-              avisar("HAY DIAS DISPONIBLES - ENEL PROVIDENCIA\n(%s)\n\n%s\n\n%s"
-                     % (ts, "\n".join(hall[:30]), URL))
-          else:
-              print(ts, "- sin dias marcados")
           PYEOF
 
-      - name: Revisar disponibilidad
-        env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python monitor.py
+      - name: Ejecutar diagnostico
+        run: python diag.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: captura
+          path: cal.png
