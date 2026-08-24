@@ -1,69 +1,46 @@
 name: monitor-enel
 
 on:
+  schedule:
+    # GitHub estrangula los schedules: en la practica esto corre ~1 vez por hora.
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: monitor-enel
+  cancel-in-progress: false
+
 jobs:
-  sonda:
+  check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Escribir sonda
-        run: |
-          cat > sonda.py << 'PYEOF'
-          import re, http.cookiejar, urllib.request, urllib.parse
-          from datetime import date
+      - name: Recuperar estado previo
+        uses: actions/cache/restore@v4
+        with:
+          path: estado.json
+          key: estado-enel-${{ github.run_id }}
+          restore-keys: |
+            estado-enel-
 
-          BASE = "https://servicequendalat.enel.com/citaprevia"
-          tarro = http.cookiejar.CookieJar()
-          ab = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(tarro))
-          ab.addheaders = [("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-                           ("Accept-Language", "es-CL,es;q=0.9")]
+      - name: Revisar disponibilidad
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          OFICINA: PROVIDENCIA
+          PATRON: empalme
+          SEMANAS: '13'
+        run: python monitor.py
 
-          def traer(url):
-              with ab.open(url, timeout=30) as r:
-                  return r.status, r.read().decode("utf-8", "replace")
-
-          st, home = traer(BASE + "/?pais=cl")
-          print("HOME:", st, len(home), "cookies:", [c.name for c in tarro])
-
-          # oficinas desde el select del home
-          sel = re.search(r'<select[^>]*[Oo]ficina[^>]*>(.*?)</select>', home, re.S)
-          if not sel:
-              sels = re.findall(r'<select.*?</select>', home, re.S)
-              print("selects encontrados:", len(sels))
-              for s in sels[:3]:
-                  print("   ", s[:300].replace("\n", " "))
-          else:
-              ops = re.findall(r'<option[^>]*value="([^"]*)"[^>]*>([^<]*)</option>', sel.group(1))
-              print("OFICINAS (primeras 8):", ops[:8])
-              prov = [o for o in ops if re.search("PROVIDENCIA", o[1], re.I)]
-              print("PROVIDENCIA ->", prov)
-
-          for idof in ("24",):
-              st, cs = traer("%s/cita/comboServicios?idOficina=%s&codServicio=&idioma=" % (BASE, idof))
-              print("COMBO oficina %s: %s %d bytes" % (idof, st, len(cs)))
-              print("   crudo:", cs[:600].replace("\n", " "))
-              serv = re.findall(r'value="(\d+)"[^>]*>([^<]+)<', cs)
-              print("   servicios:", serv[:10])
-
-          hoy = date.today().isoformat()
-          for f in (hoy, "2026-09-01", "2026-09-02", "2026-09-03"):
-              st, cal = traer("%s/cita/calendarioServicio?idServicio=11443&fecha=%s"
-                              "&grupoMaestroRaiz=1&idOficina=24" % (BASE, f))
-              libres = re.findall(r'<td[^>]*class="([^"]*diaLibre[^"]*)"[^>]*>.*?>(\d{1,2})<', cal)
-              disp = re.findall(r'Disponible\((\d+)\)', cal)
-              horas = re.findall(r'\b([01]?\d|2[0-3]):[0-5]\d\b', cal)
-              print("CAL %s: %s %d bytes | diaLibre=%s | Disponible=%s | horas=%d"
-                    % (f, st, len(cal), libres, disp[:12], len(horas)))
-              if f == "2026-09-02":
-                  i = cal.find("Disponible")
-                  print("   trozo:", cal[max(0, i-700):i+700].replace("\n", " ")[:1400])
-          PYEOF
-
-      - name: Probar API
-        run: python sonda.py
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: estado.json
+          key: estado-enel-${{ github.run_id }}
