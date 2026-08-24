@@ -204,7 +204,7 @@ def etiqueta_dia(iso):
 
 
 def revisar():
-    """Devuelve (hallazgos, dias_vistos). Lanza SitioCambio si algo no cuadra."""
+    """Devuelve (hallazgos, firma, dias_vistos). Lanza SitioCambio si algo no cuadra."""
     ab = abridor()
     idof, nombre = id_oficina(ab)
     print("oficina:", nombre, "(id %s)" % idof)
@@ -213,6 +213,7 @@ def revisar():
     print("tramites:", [t for _, t in tramites])
 
     hallazgos = []
+    marcas = []
     vistos = 0
     fechas = anclas(datetime.now(CHILE).date(), MESES)
 
@@ -247,6 +248,9 @@ def revisar():
                     lineas.append("  %s: dia habilitado" % etiqueta_dia(fecha))
                 print("    %s: %s" % (fecha, ", ".join(horas) or "sin detalle de horas"))
             hallazgos.append(etiqueta + "\n" + "\n".join(lineas))
+            # la firma va por dia, no por hora: si alguien toma una hora suelta
+            # del mismo dia no tiene sentido volver a avisar de ese dia
+            marcas.extend("%s::%s" % (etiqueta, f) for f in sorted(libres))
         else:
             print("%s -> sin horas" % etiqueta)
 
@@ -254,7 +258,7 @@ def revisar():
     if vistos == 0:
         raise SitioCambio("el calendario no devolvio ningun dia en %d meses" % MESES)
 
-    return hallazgos, vistos
+    return hallazgos, "|".join(sorted(marcas)), vistos
 
 
 def main():
@@ -262,7 +266,7 @@ def main():
     t = time.time()
 
     try:
-        hallazgos, con_datos = revisar()
+        hallazgos, firma, con_datos = revisar()
     except Exception as e:
         print("ERROR:", e, file=sys.stderr)
         if t - est.get("ts_error", 0) > REPETIR_ERROR:
@@ -276,7 +280,6 @@ def main():
     est["ts_error"] = 0
 
     if hallazgos:
-        firma = "|".join(sorted(hallazgos))
         nuevo = firma != est.get("firma")
         vencido = t - est.get("ts_aviso", 0) > REPETIR_AVISO
         if nuevo or vencido:
