@@ -193,8 +193,9 @@ def revisar():
             if dias:
                 con_datos += 1
             for d in dias:
-                horas = sorted({f["horaInicio"][:5] for f in d.get("franjas", [])
-                                if (f.get("huecosLibres") or 0) > 0})
+                # 'franjas' puede venir como null, no solo ausente
+                horas = sorted({f["horaInicio"][:5] for f in (d.get("franjas") or [])
+                                if (f.get("huecosLibres") or 0) > 0 and f.get("horaInicio")})
                 if horas:
                     libres_tramite.append((d.get("fecha", "?"), horas))
         if libres_tramite:
