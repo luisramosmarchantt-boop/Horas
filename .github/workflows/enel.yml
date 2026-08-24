@@ -1,46 +1,104 @@
 name: monitor-enel
 
 on:
-  schedule:
-    # GitHub estrangula los schedules: en la practica esto corre ~1 vez por hora.
-    - cron: '*/15 * * * *'
   workflow_dispatch:
 
-concurrency:
-  group: monitor-enel
-  cancel-in-progress: false
-
 jobs:
-  check:
+  verificar:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Recuperar estado previo
-        uses: actions/cache/restore@v4
-        with:
-          path: estado.json
-          key: estado-enel-${{ github.run_id }}
-          restore-keys: |
-            estado-enel-
+      - name: Instalar Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
 
-      - name: Revisar disponibilidad
-        env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          OFICINA: PROVIDENCIA
-          PATRON: empalme
-          SEMANAS: '13'
-        run: python monitor.py
+      - name: Escribir verificacion
+        run: |
+          cat > verifica.py << 'PYEOF'
+          import http.cookiejar, json, re, time, urllib.request
+          from playwright.sync_api import sync_playwright
 
-      - name: Guardar estado
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: estado.json
-          key: estado-enel-${{ github.run_id }}
+          BASE = "https://servicequendalat.enel.com/citaprevia"
+
+          # ---------- lado API ----------
+          tarro = http.cookiejar.CookieJar()
+          ab = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(tarro))
+          ab.addheaders = [("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+                           ("Accept-Language", "es-CL,es;q=0.9")]
+
+          def traer(u):
+              with ab.open(u, timeout=30) as r:
+                  return r.read().decode("utf-8", "replace")
+
+          traer(BASE + "/?pais=cl")
+          traer(BASE + "/cita/comboServicios?idOficina=24&codServicio=&idioma=")
+
+          print("=========== LO QUE DICE LA API ===========")
+          for idserv in (11441, 11442, 11443, 11444):
+              for f in ("2026-09-02", "2026-09-09"):
+                  crudo = traer("%s/cita/calendarioServicio?idServicio=%s&fecha=%s"
+                                "&grupoMaestroRaiz=1&idOficina=24" % (BASE, idserv, f))
+                  dias = (json.loads(crudo).get("calendario") or {}).get("dias") or []
+                  print("--- servicio %s semana de %s: %d dias" % (idserv, f, len(dias)))
+                  for d in dias:
+                      fr = d.get("franjas") or []
+                      resumen = ["%s L%s/O%s/N%s" % (x.get("horaInicio", "?")[:5],
+                                                      x.get("huecosLibres"),
+                                                      x.get("huecosOcupados"),
+                                                      x.get("numHuecos")) for x in fr]
+                      print("    %s estado=%s :: %s" % (d.get("fecha"), d.get("estado"),
+                                                        " | ".join(resumen) or "sin franjas"))
+
+          # ---------- lado navegador, mismo instante ----------
+          print("=========== LO QUE MUESTRA LA PAGINA ===========")
+          def elegir(page, patron):
+              for s in page.query_selector_all("select"):
+                  for op in s.query_selector_all("option"):
+                      if re.search(patron, (op.inner_text() or ""), re.I) and op.get_attribute("value"):
+                          s.select_option(op.get_attribute("value")); return True
+              return False
+
+          with sync_playwright() as p:
+              nav = p.chromium.launch()
+              page = nav.new_page(viewport={"width": 1280, "height": 1400})
+              try:
+                  page.goto(BASE + "/?pais=cl", wait_until="networkidle")
+                  page.wait_for_timeout(5000)
+                  elegir(page, "PROVIDENCIA")
+                  page.wait_for_timeout(4000)
+                  elegir(page, r"Redactar Contrato")
+                  page.wait_for_timeout(2000)
+                  for t in ["Continuar", "Siguiente", "Aceptar"]:
+                      b = page.query_selector("text=%s" % t)
+                      if b and b.is_visible():
+                          b.click(); break
+                  page.wait_for_timeout(6000)
+                  for _ in range(3):
+                      mes = page.evaluate("() => {const m=document.querySelector('.ui-datepicker-month');"
+                                          "const y=document.querySelector('.ui-datepicker-year');"
+                                          "return m&&y ? m.innerText+' '+y.innerText : '?';}")
+                      libres = page.evaluate("""() => [...document.querySelectorAll('.ui-datepicker-calendar td')]
+                          .filter(td => !/unselectable|ui-state-disabled/.test(td.className))
+                          .map(td => td.innerText.trim()).filter(t => /^\\d+$/.test(t))""")
+                      print("  %s -> dias seleccionables: %s" % (mes, libres))
+                      if libres:
+                          page.click(".ui-datepicker-calendar td:not(.ui-state-disabled):not(.ui-datepicker-unselectable) a")
+                          page.wait_for_timeout(5000)
+                          txt = page.inner_text("body")
+                          i = txt.find("Seleccione una hora")
+                          print("  GRILLA:", txt[i:i+900].replace("\n", " | ") if i >= 0 else "no aparecio la grilla")
+                          break
+                      nx = page.query_selector("a.ui-datepicker-next")
+                      if not nx: break
+                      nx.click(); page.wait_for_timeout(2500)
+              finally:
+                  nav.close()
+          PYEOF
+
+      - name: Comparar API contra pagina
+        run: python verifica.py
