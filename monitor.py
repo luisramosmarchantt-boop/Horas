@@ -17,15 +17,21 @@ pagina, que devuelven JSON con los huecos libres de cada franja horaria:
       -> {"calendario": {"dias": [{"fecha": "2026-09-03", "estado": 0, "franjas": [
              {"horaInicio": "13:40:00", "huecosLibres": 2, ...}]}]}}
 
-Sobre ese endpoint hay dos cosas que conviene tener claras:
+Sobre ese endpoint hay tres cosas que conviene tener claras:
 
-  - 'dias' trae los dias con horario publicado del mes al que apunta 'fecha',
-    y 'estado' vale 0 cuando el dia tiene cupos y 1 cuando esta lleno. Es el
-    mismo criterio con que la pagina pinta el dia como seleccionable.
+  - Solo responde cuando la fecha pedida cae dentro de una ventana con
+    horario publicado. Medido el 31-08-2026 en Providencia: fecha=2026-08-31
+    devuelve {}, fecha=2026-09-01 devuelve del 07 al 11 de septiembre, y
+    fecha=2026-10-01 devuelve {} de nuevo. Por eso no sirve anclar en hoy ni
+    en el dia 1 de cada mes: hay que ir caminando las ventanas.
 
-  - 'franjas' solo viene rellena para la semana que contiene 'fecha'; para el
-    resto llega vacia o nula. Por eso hay que anclar en el dia que interesa
-    para poder leer sus horas, en vez de recorrer el calendario a saltos.
+  - 'franjas' solo viene rellena cuando la fecha pedida es la del propio dia;
+    desde otra ancla llega nula. Asi que para saber si un dia tiene cupo hay
+    que preguntar por ese dia.
+
+  - 'estado' no alcanza para decidir: los dias del 07 al 11 de septiembre
+    llegaban con estado=1 y franjas=null desde el ancla del mes, y al anclar
+    en cada dia aparecian sus 10 franjas. La verdad esta en huecosLibres.
 """
 
 import http.cookiejar
@@ -41,7 +47,8 @@ from datetime import date, datetime, timedelta, timezone
 
 BASE = os.environ.get("BASE", "https://servicequendalat.enel.com/citaprevia")
 PORTADA = BASE + "/?pais=cl"
-OFICINA = os.environ.get("OFICINA", r"PROVIDENCIA")
+# los empalmes solo existen en Providencia y La Florida; se puede ampliar
+OFICINAS = os.environ.get("OFICINAS", os.environ.get("OFICINA", r"PROVIDENCIA|LA FLORIDA"))
 PATRON = os.environ.get("PATRON", r"empalme")
 MESES = int(os.environ.get("MESES", "4"))
 ESTADO = os.environ.get("ESTADO", "estado.json")
@@ -130,17 +137,17 @@ def traer(ab, url, reintentos=3):
     raise SitioCambio("no pude leer %s: %s" % (url, ultimo))
 
 
-def id_oficina(ab):
-    """Saca el id de la oficina del <select> de la portada."""
+def oficinas(ab):
+    """Todas las oficinas del <select> de la portada que calzan con el patron."""
     html = traer(ab, PORTADA)
     opciones = re.findall(r'<option[^>]*value="(\d+)"[^>]*>([^<]*)</option>', html)
     if not opciones:
         raise SitioCambio("la portada no trae el listado de oficinas")
-    for idof, nombre in opciones:
-        if re.search(OFICINA, nombre, re.I):
-            return idof, nombre.strip()
-    raise SitioCambio("no encontre la oficina %r; hay %d opciones"
-                      % (OFICINA, len(opciones)))
+    elegidas = [(i, n.strip()) for i, n in opciones if re.search(OFICINAS, n, re.I)]
+    if not elegidas:
+        raise SitioCambio("ninguna oficina calza con %r; hay %d en la portada"
+                          % (OFICINAS, len(opciones)))
+    return elegidas
 
 
 def servicios(ab, idof):
@@ -178,21 +185,56 @@ def horas_libres(dia):
                    if (f.get("huecosLibres") or 0) > 0 and f.get("horaInicio")})
 
 
-def tiene_cupo(dia):
-    """El sitio marca el dia con estado 0; las franjas confirman cuando vienen."""
-    return dia.get("estado") == 0 or bool(horas_libres(dia))
-
-
-def anclas(hoy, meses):
-    """Hoy, y despues el primer dia de cada mes siguiente."""
-    fechas = [hoy]
+def semillas(hoy, meses):
+    """Fechas desde donde tantear: el endpoint solo responde dentro de una
+    ventana publicada, asi que se prueban varios puntos del calendario."""
+    fechas = [hoy, hoy + timedelta(days=1)]
     a, m = hoy.year, hoy.month
-    for _ in range(meses - 1):
+    for _ in range(meses):
+        fechas.append(date(a, m, 1))
+        fechas.append(date(a, m, 15))
         m += 1
         if m > 12:
             a, m = a + 1, 1
-        fechas.append(date(a, m, 1))
-    return fechas
+    return [f.isoformat() for f in fechas]
+
+
+def dias_publicados(ab, idserv, idof, hoy, tope_consultas=30):
+    """Camina las ventanas publicadas y devuelve {fecha: dia}.
+
+    Parte de las semillas y, cada vez que una responde, se asoma mas alla del
+    ultimo dia devuelto, porque las ventanas siguientes solo aparecen si se
+    pregunta por una fecha que caiga dentro de ellas.
+    """
+    vistos = {}
+    pendientes = semillas(hoy, MESES)
+    intentadas = set()
+    while pendientes and len(intentadas) < tope_consultas:
+        f = pendientes.pop(0)
+        if f in intentadas:
+            continue
+        intentadas.add(f)
+        dias = calendario(ab, idserv, idof, f)
+        if not dias:
+            continue
+        fechas = [d["fecha"] for d in dias if d.get("fecha")]
+        for d in dias:
+            if d.get("fecha"):
+                vistos.setdefault(d["fecha"], d)
+        if fechas:
+            sig = (date.fromisoformat(max(fechas)) + timedelta(days=3)).isoformat()
+            if sig not in intentadas:
+                pendientes.append(sig)
+    return vistos
+
+
+def horas_del_dia(ab, idserv, idof, fecha):
+    """Horas con cupo de un dia. Hay que anclar en el dia: desde otra fecha
+    las franjas llegan nulas y el dia parece lleno aunque no lo este."""
+    for d in calendario(ab, idserv, idof, fecha):
+        if d.get("fecha") == fecha:
+            return horas_libres(d), d.get("estado")
+    return [], None
 
 
 def etiqueta_dia(iso):
@@ -206,38 +248,34 @@ def etiqueta_dia(iso):
 def revisar():
     """Devuelve (hallazgos, firma, dias_vistos). Lanza SitioCambio si algo no cuadra."""
     ab = abridor()
-    idof, nombre = id_oficina(ab)
-    print("oficina:", nombre, "(id %s)" % idof)
-
-    tramites = servicios(ab, idof)
-    print("tramites:", [t for _, t in tramites])
-
+    hoy = datetime.now(CHILE).date()
     hallazgos = []
     marcas = []
     vistos = 0
-    fechas = anclas(datetime.now(CHILE).date(), MESES)
 
-    for idserv, etiqueta in tramites:
-        libres = {}
-        for ancla in fechas:
-            for dia in calendario(ab, idserv, idof, ancla.isoformat()):
-                vistos += 1
-                if not tiene_cupo(dia):
-                    continue
-                fecha = dia.get("fecha")
-                if not fecha or fecha in libres:
-                    continue
-                # las franjas solo vienen para la semana apuntada: pedimos ese dia
-                horas = horas_libres(dia)
-                if not horas:
-                    for d in calendario(ab, idserv, idof, fecha):
-                        if d.get("fecha") == fecha:
-                            horas = horas_libres(d)
-                            break
-                libres[fecha] = horas
+    for idof, nombre in oficinas(ab):
+        print("oficina:", nombre, "(id %s)" % idof)
+        for idserv, etiqueta in servicios(ab, idof):
+            dias = dias_publicados(ab, idserv, idof, hoy)
+            vistos += len(dias)
+            if not dias:
+                print("  %s -> sin ventana publicada" % etiqueta)
+                continue
 
-        if libres:
-            print("%s -> %d dias con cupo" % (etiqueta, len(libres)))
+            libres = {}
+            for fecha in sorted(dias):
+                horas, estado = horas_del_dia(ab, idserv, idof, fecha)
+                if horas:
+                    libres[fecha] = horas
+                elif estado == 0:
+                    # el sitio lo pinta seleccionable aunque no leamos franjas
+                    libres[fecha] = []
+
+            print("  %s -> %s..%s (%d dias), %d con cupo"
+                  % (etiqueta, min(dias), max(dias), len(dias), len(libres)))
+            if not libres:
+                continue
+
             lineas = []
             for fecha, horas in sorted(libres.items()):
                 if horas:
@@ -247,16 +285,16 @@ def revisar():
                 else:
                     lineas.append("  %s: dia habilitado" % etiqueta_dia(fecha))
                 print("    %s: %s" % (fecha, ", ".join(horas) or "sin detalle de horas"))
-            hallazgos.append(etiqueta + "\n" + "\n".join(lineas))
+            hallazgos.append("%s - %s\n%s" % (nombre, etiqueta, "\n".join(lineas)))
             # la firma va por dia, no por hora: si alguien toma una hora suelta
             # del mismo dia no tiene sentido volver a avisar de ese dia
-            marcas.extend("%s::%s" % (etiqueta, f) for f in sorted(libres))
-        else:
-            print("%s -> sin horas" % etiqueta)
+            marcas.extend("%s::%s::%s" % (idof, etiqueta, f) for f in sorted(libres))
 
-    # si no vimos ni un dia, el formato cambio: no podemos afirmar que no hay horas
+    # si ninguna oficina devolvio un solo dia, el formato cambio: no podemos
+    # afirmar que no hay horas
     if vistos == 0:
-        raise SitioCambio("el calendario no devolvio ningun dia en %d meses" % MESES)
+        raise SitioCambio("ninguna oficina devolvio dias publicados; "
+                          "el sitio o la API cambiaron")
 
     return hallazgos, "|".join(sorted(marcas)), vistos
 
@@ -283,8 +321,8 @@ def main():
         nuevo = firma != est.get("firma")
         vencido = t - est.get("ts_aviso", 0) > REPETIR_AVISO
         if nuevo or vencido:
-            avisar("HAY HORAS - ENEL %s\n(%s)\n\n%s\n\n%s"
-                   % (OFICINA, ahora(), "\n\n".join(hallazgos), PORTADA))
+            avisar("HAY HORAS - ENEL\n(%s)\n\n%s\n\n%s"
+                   % (ahora(), "\n\n".join(hallazgos), PORTADA))
             est["firma"] = firma
             est["ts_aviso"] = t
             est["ts_latido"] = t
@@ -295,7 +333,7 @@ def main():
         est["firma"] = ""
         if t - est.get("ts_latido", 0) > LATIDO:
             avisar("Monitor de Enel funcionando (%s). Sigo revisando %s, por ahora sin horas."
-                   % (ahora(), OFICINA))
+                   % (ahora(), OFICINAS))
             est["ts_latido"] = t
 
     guardar_estado(est)

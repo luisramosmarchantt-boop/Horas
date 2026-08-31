@@ -13,7 +13,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
@@ -33,10 +33,10 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          OFICINA: PROVIDENCIA
+          OFICINAS: PROVIDENCIA|LA FLORIDA
           PATRON: empalme
           MESES: '4'
-        run: python sonda.py
+        run: python monitor.py
 
       - name: Guardar estado
         if: always()
