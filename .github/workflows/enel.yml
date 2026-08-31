@@ -36,7 +36,7 @@ jobs:
           OFICINA: PROVIDENCIA
           PATRON: empalme
           MESES: '4'
-        run: python monitor.py
+        run: python sonda.py
 
       - name: Guardar estado
         if: always()
