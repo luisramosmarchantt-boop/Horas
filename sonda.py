@@ -1,5 +1,5 @@
-"""Sonda temporal: mira que devuelve de verdad calendarioServicio."""
-import http.cookiejar, json, re, sys, time, urllib.request
+"""Sonda: busca dias con cupo en TODAS las oficinas y trámites."""
+import http.cookiejar, json, re, time, urllib.request
 from datetime import date, timedelta
 
 BASE = "https://servicequendalat.enel.com/citaprevia"
@@ -17,65 +17,54 @@ def traer(u):
 
 html = traer(PORTADA)
 ofs = re.findall(r'<option[^>]*value="(\d+)"[^>]*>([^<]*)</option>', html)
-print("=== OFICINAS (%d) ===" % len(ofs))
-for i, n in ofs:
-    print("   ", i, n.strip())
 
-idof = next(i for i, n in ofs if re.search("PROVIDENCIA", n, re.I))
-print("\n=== usando oficina", idof)
+hoy = date.today()
+anclas = [hoy, hoy + timedelta(days=7), hoy + timedelta(days=21),
+          hoy + timedelta(days=45), hoy + timedelta(days=75)]
 
-servs = json.loads(traer("%s/cita/comboServicios?idOficina=%s&codServicio=&idioma=" % (BASE, idof)))
-todos = servs.get("servicios") or []
-print("=== SERVICIOS DE LA OFICINA (%d) ===" % len(todos))
-for s in todos:
-    print("   ", s.get("idServicio"), "|", s.get("auxServicio"))
+print("=== BARRIDO COMPLETO: %d oficinas ===" % len(ofs))
+total_libres = 0
+for idof, nombre in ofs:
+    try:
+        servs = json.loads(traer("%s/cita/comboServicios?idOficina=%s&codServicio=&idioma="
+                                 % (BASE, idof))).get("servicios") or []
+    except Exception as e:
+        print("\n## %s (%s): fallo comboServicios: %s" % (nombre.strip(), idof, e))
+        continue
+    print("\n## %s (id %s) - %d servicios" % (nombre.strip(), idof, len(servs)))
+    for s in servs:
+        idserv, et = s.get("idServicio"), (s.get("auxServicio") or "").strip()
+        dias = {}
+        for a in anclas:
+            try:
+                d = json.loads(traer("%s/cita/calendarioServicio?idServicio=%s&fecha=%s"
+                                     "&grupoMaestroRaiz=1&idOficina=%s"
+                                     % (BASE, idserv, a.isoformat(), idof)))
+            except Exception:
+                continue
+            for x in ((d.get("calendario") or {}).get("dias") or []):
+                f = x.get("fecha")
+                if f and f not in dias:
+                    dias[f] = x
+            time.sleep(0.1)
+        if not dias:
+            print("   - %-52s sin calendario publicado" % et[:52])
+            continue
+        libres = {f: x for f, x in dias.items() if x.get("estado") == 0}
+        rango = "%s..%s" % (min(dias), max(dias))
+        if libres:
+            total_libres += len(libres)
+            print("   *** %-48s %s | CON CUPO: %s" % (et[:48], rango, sorted(libres)))
+            for f in sorted(libres):
+                d2 = json.loads(traer("%s/cita/calendarioServicio?idServicio=%s&fecha=%s"
+                                      "&grupoMaestroRaiz=1&idOficina=%s"
+                                      % (BASE, idserv, f, idof)))
+                for x in ((d2.get("calendario") or {}).get("dias") or []):
+                    if x.get("fecha") == f:
+                        hs = sorted({y["horaInicio"][:5] for y in (x.get("franjas") or [])
+                                     if (y.get("huecosLibres") or 0) > 0 and y.get("horaInicio")})
+                        print("           %s -> %s" % (f, hs or "estado 0 pero sin franjas"))
+        else:
+            print("   - %-52s %s | %d dias, todos llenos" % (et[:52], rango, len(dias)))
 
-emp = [(s["idServicio"], s["auxServicio"]) for s in todos
-       if re.search("empalme", s.get("auxServicio", ""), re.I)]
-
-# 1) forma cruda de una respuesta
-idserv, et = emp[0]
-for f in ["2026-08-31", "2026-09-01", "2026-09-15", "2026-10-01"]:
-    crudo = traer("%s/cita/calendarioServicio?idServicio=%s&fecha=%s"
-                  "&grupoMaestroRaiz=1&idOficina=%s" % (BASE, idserv, f, idof))
-    d = json.loads(crudo)
-    dias = (d.get("calendario") or {}).get("dias") or []
-    print("\n--- ancla %s | %s | %d dias" % (f, et[:40], len(dias)))
-    print("    claves calendario:", list((d.get("calendario") or {}).keys()))
-    if dias:
-        print("    rango:", dias[0].get("fecha"), "->", dias[-1].get("fecha"))
-        for x in dias:
-            fr = x.get("franjas")
-            libres = sum((y.get("huecosLibres") or 0) for y in (fr or []))
-            print("      %s estado=%s franjas=%s huecosLibres=%s"
-                  % (x.get("fecha"), x.get("estado"),
-                     "null" if fr is None else len(fr), libres))
-    if f == "2026-08-31":
-        print("    CRUDO (1200):", crudo[:1200])
-
-# 2) barrido semanal de TODOS los servicios de la oficina, sept y oct
-print("\n=== BARRIDO SEMANAL (todos los servicios) ===")
-hoy = date(2026, 8, 31)
-anclas = [hoy + timedelta(days=7 * k) for k in range(10)]
-for s in todos:
-    idserv, et = s["idServicio"], s.get("auxServicio", "")
-    encontrados = []
-    for a in anclas:
-        try:
-            d = json.loads(traer("%s/cita/calendarioServicio?idServicio=%s&fecha=%s"
-                                 "&grupoMaestroRaiz=1&idOficina=%s"
-                                 % (BASE, idserv, a.isoformat(), idof)))
-        except Exception as e:
-            print("   !! %s %s: %s" % (et[:30], a, e)); continue
-        for x in ((d.get("calendario") or {}).get("dias") or []):
-            if x.get("estado") == 0:
-                fr = x.get("franjas") or []
-                horas = sorted({y["horaInicio"][:5] for y in fr
-                                if (y.get("huecosLibres") or 0) > 0 and y.get("horaInicio")})
-                encontrados.append((x.get("fecha"), horas))
-        time.sleep(0.15)
-    if encontrados:
-        vistos = sorted(set(f for f, _ in encontrados))
-        print("  *** %s (%s): %s" % (et, idserv, vistos[:15]))
-        for f, h in encontrados[:6]:
-            if h: print("        %s -> %s" % (f, h))
+print("\n=== TOTAL DIAS CON CUPO EN TODO EL PAIS: %d ===" % total_libres)
