@@ -13,7 +13,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +36,10 @@ jobs:
           OFICINAS: PROVIDENCIA|LA FLORIDA
           PATRON: empalme
           MESES: '4'
+          # cada corrida se queda sondeando este rato en horario habil chileno,
+          # porque GitHub estrangula los schedules y no controlamos el arranque
+          SONDEO_UTIL: '15'
+          PAUSA: '90'
         run: python monitor.py
 
       - name: Guardar estado

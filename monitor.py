@@ -56,6 +56,15 @@ ESTADO = os.environ.get("ESTADO", "estado.json")
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
+# cuanto rato se queda sondeando cada corrida, en minutos
+SONDEO_UTIL = int(os.environ.get("SONDEO_UTIL", "15"))
+SONDEO_FUERA = int(os.environ.get("SONDEO_FUERA", "0"))
+# pausa entre pasadas dentro de una misma corrida
+PAUSA = int(os.environ.get("PAUSA", "90"))
+# franja horaria chilena en que Enel carga y libera cupos
+HORA_DESDE = int(os.environ.get("HORA_DESDE", "8"))
+HORA_HASTA = int(os.environ.get("HORA_HASTA", "19"))
+
 # cada cuanto repetir un aviso si la disponibilidad no cambio
 REPETIR_AVISO = 2 * 3600
 # cada cuanto avisar de una falla del monitor
@@ -246,11 +255,21 @@ def etiqueta_dia(iso):
 
 
 def revisar():
-    """Devuelve (hallazgos, firma, dias_vistos). Lanza SitioCambio si algo no cuadra."""
+    """Una pasada completa.
+
+    Devuelve (hallazgos, firma, publicados, dias_vistos), donde 'publicados' son
+    todos los dias que Enel tiene con horario cargado, tengan cupo o no: que
+    aparezca una semana nueva es la senal mas temprana que existe, porque los
+    cupos se toman a las pocas horas de publicarse.
+
+    Lanza SitioCambio si nada responde, para no confundir una caida con un
+    "no hay horas".
+    """
     ab = abridor()
     hoy = datetime.now(CHILE).date()
     hallazgos = []
     marcas = []
+    publicados = {}
     vistos = 0
 
     for idof, nombre in oficinas(ab):
@@ -261,6 +280,9 @@ def revisar():
             if not dias:
                 print("  %s -> sin ventana publicada" % etiqueta)
                 continue
+
+            for fecha in dias:
+                publicados["%s::%s::%s" % (idof, idserv, fecha)] = (nombre, etiqueta, fecha)
 
             libres = {}
             for fecha in sorted(dias):
@@ -290,21 +312,48 @@ def revisar():
             # del mismo dia no tiene sentido volver a avisar de ese dia
             marcas.extend("%s::%s::%s" % (idof, etiqueta, f) for f in sorted(libres))
 
-    # si ninguna oficina devolvio un solo dia, el formato cambio: no podemos
-    # afirmar que no hay horas
     if vistos == 0:
         raise SitioCambio("ninguna oficina devolvio dias publicados; "
                           "el sitio o la API cambiaron")
 
-    return hallazgos, "|".join(sorted(marcas)), vistos
+    return hallazgos, "|".join(sorted(marcas)), publicados, vistos
 
 
-def main():
-    est = cargar_estado()
+def avisar_publicados(est, publicados, t):
+    """Avisa cuando Enel carga dias que no habiamos visto nunca."""
+    conocidos = est.get("publicados")
+    if conocidos is None:
+        # primera vez: tomar nota sin avisar, si no avisaria de todo el calendario
+        est["publicados"] = sorted(publicados)
+        print("primer registro: %d dias publicados anotados sin avisar" % len(publicados))
+        return False
+
+    conocidos = set(conocidos)
+    nuevos = [publicados[k] for k in publicados if k not in conocidos]
+    # se acumula y se podan los dias ya pasados: si una pasada falla a medias,
+    # los dias que no vinieron esta vez no deben reaparecer como "nuevos"
+    hoy = datetime.now(CHILE).date().isoformat()
+    est["publicados"] = sorted(k for k in conocidos | set(publicados)
+                               if k.rsplit("::", 1)[-1] >= hoy)
+    if not nuevos:
+        return False
+
+    porgrupo = {}
+    for nombre, etiqueta, fecha in nuevos:
+        porgrupo.setdefault("%s - %s" % (nombre, etiqueta), []).append(fecha)
+    detalle = "\n".join("%s\n  %s" % (g, ", ".join(etiqueta_dia(f) for f in sorted(fs)))
+                        for g, fs in sorted(porgrupo.items()))
+    avisar("ENEL PUBLICO DIAS NUEVOS\n(%s)\n\n%s\n\nLos cupos se toman rapido, "
+           "conviene entrar ahora.\n\n%s" % (ahora(), detalle, PORTADA))
+    est["ts_latido"] = t
+    return True
+
+
+def una_pasada(est):
+    """Revisa y avisa lo que corresponda. Devuelve True si mando algun aviso."""
     t = time.time()
-
     try:
-        hallazgos, firma, con_datos = revisar()
+        hallazgos, firma, publicados, con_datos = revisar()
     except Exception as e:
         print("ERROR:", e, file=sys.stderr)
         if t - est.get("ts_error", 0) > REPETIR_ERROR:
@@ -316,6 +365,7 @@ def main():
         raise
 
     est["ts_error"] = 0
+    aviso = avisar_publicados(est, publicados, t)
 
     if hallazgos:
         nuevo = firma != est.get("firma")
@@ -326,6 +376,7 @@ def main():
             est["firma"] = firma
             est["ts_aviso"] = t
             est["ts_latido"] = t
+            aviso = True
         else:
             print("las mismas horas ya avisadas, no repito")
     else:
@@ -335,8 +386,54 @@ def main():
             avisar("Monitor de Enel funcionando (%s). Sigo revisando %s, por ahora sin horas."
                    % (ahora(), OFICINAS))
             est["ts_latido"] = t
+            aviso = True
 
     guardar_estado(est)
+    return aviso
+
+
+def minutos_de_sondeo(momento):
+    """Cuanto rato sondear en esta corrida.
+
+    GitHub estrangula los schedules de los repos privados: pedimos una revision
+    cada 15 minutos y en la practica corre cada ~3,4 horas. Como no controlamos
+    cuando arranca la corrida, cada una se queda un rato sondeando en vez de
+    mirar una sola vez. El presupuesto de Actions (~2000 min al mes) se gasta
+    donde sirve: en el horario en que Enel carga y libera cupos.
+    """
+    if momento.weekday() >= 5:
+        return SONDEO_FUERA
+    return SONDEO_UTIL if HORA_DESDE <= momento.hour < HORA_HASTA else SONDEO_FUERA
+
+
+def main():
+    est = cargar_estado()
+    inicio = datetime.now(CHILE)
+    tope = minutos_de_sondeo(inicio) * 60
+    fin = time.time() + tope
+    print("%s - sondeando hasta %d min, cada %d s" % (ahora(), tope // 60, PAUSA))
+
+    pasada = 0
+    fallas = 0
+    ultimo = None
+    while True:
+        pasada += 1
+        print("--- pasada %d ---" % pasada)
+        try:
+            una_pasada(est)
+        except Exception as e:
+            # una caida puntual no puede comerse el resto de la ventana: se
+            # anota y se sigue sondeando, y recien al final se decide
+            fallas += 1
+            ultimo = e
+        if time.time() + PAUSA >= fin:
+            break
+        time.sleep(PAUSA)
+
+    print("%s - fin de la corrida (%d pasadas, %d fallidas)" % (ahora(), pasada, fallas))
+    if fallas == pasada:
+        # ninguna pasada llego a leer el sitio: la corrida tiene que salir roja
+        raise ultimo
 
 
 if __name__ == "__main__":
