@@ -2,7 +2,9 @@ name: monitor-enel
 
 on:
   schedule:
-    # GitHub estrangula los schedules: en la practica esto corre ~1 vez por hora.
+    # GitHub estrangula los schedules del repo privado: se pide cada 15 min y
+    # en la practica arranca cada ~3,5 horas (medido en septiembre de 2026).
+    # Por eso cada corrida se queda sondeando un rato; ver monitor.py.
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
@@ -13,7 +15,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
@@ -36,10 +38,11 @@ jobs:
           OFICINAS: PROVIDENCIA|LA FLORIDA
           PATRON: empalme
           MESES: '4'
-          # cada corrida se queda sondeando este rato en horario habil chileno,
-          # porque GitHub estrangula los schedules y no controlamos el arranque
-          SONDEO_UTIL: '15'
           PAUSA: '90'
+          # para saber si el repo es publico (minutos gratis: vigilancia
+          # continua) o privado (se reparte el presupuesto del mes)
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: python monitor.py
 
       - name: Guardar estado

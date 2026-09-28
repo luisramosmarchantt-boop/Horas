@@ -56,9 +56,22 @@ ESTADO = os.environ.get("ESTADO", "estado.json")
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-# cuanto rato se queda sondeando cada corrida, en minutos
-SONDEO_UTIL = int(os.environ.get("SONDEO_UTIL", "15"))
-SONDEO_FUERA = int(os.environ.get("SONDEO_FUERA", "0"))
+# techo de sondeo por corrida en horario habil, en minutos (repo privado)
+SONDEO_MAX = int(os.environ.get("SONDEO_MAX", "40"))
+# minutos de Actions que nos permitimos gastar al mes en un repo privado; el
+# plan gratis da 2000 y si se agotan GitHub deja de correr el monitor hasta
+# fin de mes, asi que se deja holgura
+LIMITE_MES = int(os.environ.get("LIMITE_MES", "1700"))
+# corridas en horario habil que GitHub alcanza a arrancar por dia (medido:
+# 2,7 entre el 12 y el 28 de septiembre de 2026)
+CORRIDAS_HABILES = float(os.environ.get("CORRIDAS_HABILES", "3"))
+# lo que cuesta una corrida fuera de horario (una pasada + arranque), en s
+COSTO_FUERA = int(os.environ.get("COSTO_FUERA", "90"))
+# en repo publico los minutos son gratis: se vigila de corrido, con el tope
+# de 6 horas que GitHub pone a un job
+SONDEO_PUBLICO_MAX = int(os.environ.get("SONDEO_PUBLICO_MAX", "345"))
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
+GH_REPO = os.environ.get("GH_REPO", "")
 # pausa entre pasadas dentro de una misma corrida
 PAUSA = int(os.environ.get("PAUSA", "90"))
 # franja horaria chilena en que Enel carga y libera cupos
@@ -392,43 +405,131 @@ def una_pasada(est):
     return aviso
 
 
-def minutos_de_sondeo(momento):
+def repo_publico():
+    """Pregunta a GitHub si el repo es publico. Ante la duda, privado: asi
+    nunca se gasta de mas."""
+    if not (GH_TOKEN and GH_REPO):
+        return False
+    try:
+        pedido = urllib.request.Request(
+            "https://api.github.com/repos/%s" % GH_REPO,
+            headers={"Authorization": "Bearer %s" % GH_TOKEN,
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(pedido, timeout=20) as r:
+            return json.loads(r.read().decode()).get("private") is False
+    except Exception as e:
+        print("no pude leer la visibilidad del repo (%s); asumo privado" % e)
+        return False
+
+
+def en_horario(momento):
+    return momento.weekday() < 5 and HORA_DESDE <= momento.hour < HORA_HASTA
+
+
+def habiles_restantes(momento):
+    """Dias habiles que quedan en el mes, contando hoy."""
+    d = momento.date()
+    n = 0
+    while d.month == momento.month:
+        if d.weekday() < 5:
+            n += 1
+        d += timedelta(days=1)
+    return max(1, n)
+
+
+def dias_restantes(momento):
+    d = momento.date()
+    n = 0
+    while d.month == momento.month:
+        n += 1
+        d += timedelta(days=1)
+    return n
+
+
+def segundos_de_sondeo(momento, est, publico):
     """Cuanto rato sondear en esta corrida.
 
-    GitHub estrangula los schedules de los repos privados: pedimos una revision
-    cada 15 minutos y en la practica corre cada ~3,4 horas. Como no controlamos
-    cuando arranca la corrida, cada una se queda un rato sondeando en vez de
-    mirar una sola vez. El presupuesto de Actions (~2000 min al mes) se gasta
-    donde sirve: en el horario en que Enel carga y libera cupos.
+    GitHub estrangula los schedules: se pide cada 15 minutos y en la practica
+    arranca cada ~3,5 horas. No controlamos cuando arranca la corrida, pero
+    si cuanto dura.
+
+    - Repo publico: minutos gratis, asi que se vigila de corrido hasta el fin
+      del horario habil. Como cada corrida dura mas que el hueco entre
+      arranques, las corridas se encadenan y la vigilancia queda continua.
+    - Repo privado: se reparte lo que queda del presupuesto del mes entre las
+      corridas habiles que faltan. Si el mes viene holgado las ventanas se
+      alargan solas, y si viene justo se achican, sin pasarse nunca.
     """
-    if momento.weekday() >= 5:
-        return SONDEO_FUERA
-    return SONDEO_UTIL if HORA_DESDE <= momento.hour < HORA_HASTA else SONDEO_FUERA
+    if not en_horario(momento):
+        return 0
+    if publico:
+        cierre = momento.replace(hour=HORA_HASTA, minute=0, second=0, microsecond=0)
+        return int(min((cierre - momento).total_seconds(), SONDEO_PUBLICO_MAX * 60))
+
+    usados = consumo_del_mes(est, momento)
+    reserva = COSTO_FUERA * 4 * dias_restantes(momento)  # corridas nocturnas y de fin de semana
+    disponible = LIMITE_MES * 60 - usados - reserva
+    por_corrida = disponible / (habiles_restantes(momento) * CORRIDAS_HABILES)
+    return int(max(0, min(por_corrida, SONDEO_MAX * 60)))
+
+
+def consumo_supuesto(momento):
+    """Sin registro del mes (primera corrida, o cache perdido a mitad de mes)
+    no sabemos cuanto se gasto: se supone lo proporcional a los dias ya
+    pasados, que es conservador."""
+    total = (dias_restantes(momento) + momento.day - 1)
+    return int(LIMITE_MES * 60 * (momento.day - 1) / total)
+
+
+def consumo_del_mes(est, momento):
+    mes = momento.strftime("%Y-%m")
+    c = est.get("consumo") or {}
+    if c.get("mes") == mes:
+        return c.get("segundos", 0)
+    return 0 if momento.day == 1 else consumo_supuesto(momento)
+
+
+def anotar_consumo(est, momento, segundos):
+    mes = momento.strftime("%Y-%m")
+    c = est.get("consumo") or {}
+    if c.get("mes") != mes:
+        c = {"mes": mes, "segundos": consumo_del_mes({}, momento)}
+    # GitHub cobra por minuto entero y el arranque del job tambien cuenta
+    c["segundos"] = c.get("segundos", 0) + (int(segundos) // 60 + 1) * 60 + 30
+    est["consumo"] = c
 
 
 def main():
     est = cargar_estado()
     inicio = datetime.now(CHILE)
-    tope = minutos_de_sondeo(inicio) * 60
-    fin = time.time() + tope
-    print("%s - sondeando hasta %d min, cada %d s" % (ahora(), tope // 60, PAUSA))
+    t0 = time.time()
+    publico = repo_publico()
+    tope = segundos_de_sondeo(inicio, est, publico)
+    fin = t0 + tope
+    print("%s - repo %s, sondeando %d min, cada %d s (consumo del mes: %d min)"
+          % (ahora(), "publico" if publico else "privado", tope // 60, PAUSA,
+             consumo_del_mes(est, inicio) // 60))
 
     pasada = 0
     fallas = 0
     ultimo = None
-    while True:
-        pasada += 1
-        print("--- pasada %d ---" % pasada)
-        try:
-            una_pasada(est)
-        except Exception as e:
-            # una caida puntual no puede comerse el resto de la ventana: se
-            # anota y se sigue sondeando, y recien al final se decide
-            fallas += 1
-            ultimo = e
-        if time.time() + PAUSA >= fin:
-            break
-        time.sleep(PAUSA)
+    try:
+        while True:
+            pasada += 1
+            print("--- pasada %d ---" % pasada)
+            try:
+                una_pasada(est)
+            except Exception as e:
+                # una caida puntual no puede comerse el resto de la ventana: se
+                # anota y se sigue sondeando, y recien al final se decide
+                fallas += 1
+                ultimo = e
+            if time.time() + PAUSA >= fin:
+                break
+            time.sleep(PAUSA)
+    finally:
+        anotar_consumo(est, inicio, time.time() - t0)
+        guardar_estado(est)
 
     print("%s - fin de la corrida (%d pasadas, %d fallidas)" % (ahora(), pasada, fallas))
     if fallas == pasada:
