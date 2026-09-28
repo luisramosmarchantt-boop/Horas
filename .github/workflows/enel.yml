@@ -43,7 +43,7 @@ jobs:
           # continua) o privado (se reparte el presupuesto del mes)
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: python monitor.py
+        run: python -u monitor.py
 
       - name: Guardar estado
         if: always()

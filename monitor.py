@@ -44,6 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 BASE = os.environ.get("BASE", "https://servicequendalat.enel.com/citaprevia")
 PORTADA = BASE + "/?pais=cl"
@@ -74,6 +75,14 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "")
 GH_REPO = os.environ.get("GH_REPO", "")
 # pausa entre pasadas dentro de una misma corrida
 PAUSA = int(os.environ.get("PAUSA", "90"))
+# Enel publica la semana subsiguiente los lunes en la manana: en el ultimo mes
+# la semana nueva aparecio siempre entre las 09:34 y las 10:43, y cuando la
+# vimos ya estaba llena. En esa franja se revisa mas seguido.
+PAUSA_PUBLICACION = int(os.environ.get("PAUSA_PUBLICACION", "45"))
+PUBLICACION_DESDE = int(os.environ.get("PUBLICACION_DESDE", "9"))
+PUBLICACION_HASTA = int(os.environ.get("PUBLICACION_HASTA", "12"))
+# de noche no se publica ni se agenda: se espacia para no cargar el sitio
+PAUSA_NOCHE = int(os.environ.get("PAUSA_NOCHE", "300"))
 # franja horaria chilena en que Enel carga y libera cupos
 HORA_DESDE = int(os.environ.get("HORA_DESDE", "8"))
 HORA_HASTA = int(os.environ.get("HORA_HASTA", "19"))
@@ -85,7 +94,10 @@ REPETIR_ERROR = 6 * 3600
 # cada cuanto mandar el "sigo vivo"
 LATIDO = 24 * 3600
 
-CHILE = timezone(timedelta(hours=-4))
+# hora oficial de Chile continental: cambia sola entre invierno (UTC-4) y
+# verano (UTC-3). Con un desfase fijo los avisos marcaban una hora menos
+# desde el cambio de horario del 6 de septiembre de 2026.
+CHILE = ZoneInfo("America/Santiago")
 DIAS = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]
 
 NAVEGADOR = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -422,6 +434,14 @@ def repo_publico():
         return False
 
 
+def pausa_para(momento):
+    if momento.weekday() == 0 and PUBLICACION_DESDE <= momento.hour < PUBLICACION_HASTA:
+        return PAUSA_PUBLICACION
+    if not HORA_DESDE <= momento.hour < HORA_HASTA:
+        return PAUSA_NOCHE
+    return PAUSA
+
+
 def en_horario(momento):
     return momento.weekday() < 5 and HORA_DESDE <= momento.hour < HORA_HASTA
 
@@ -453,18 +473,20 @@ def segundos_de_sondeo(momento, est, publico):
     arranca cada ~3,5 horas. No controlamos cuando arranca la corrida, pero
     si cuanto dura.
 
-    - Repo publico: minutos gratis, asi que se vigila de corrido hasta el fin
-      del horario habil. Como cada corrida dura mas que el hueco entre
-      arranques, las corridas se encadenan y la vigilancia queda continua.
+    - Repo publico: minutos gratis, asi que cada corrida vigila casi 6 horas
+      a cualquier hora. Como cada corrida dura mas que el hueco entre
+      arranques, se encadenan y la vigilancia queda continua.
     - Repo privado: se reparte lo que queda del presupuesto del mes entre las
       corridas habiles que faltan. Si el mes viene holgado las ventanas se
       alargan solas, y si viene justo se achican, sin pasarse nunca.
     """
+    if publico:
+        # gratis: cada corrida vigila todo lo que GitHub deja, a cualquier
+        # hora. Como los arranques no llegan a tiempo fijo, una corrida que
+        # parte de madrugada es la que termina cubriendo el lunes a las 10.
+        return SONDEO_PUBLICO_MAX * 60
     if not en_horario(momento):
         return 0
-    if publico:
-        cierre = momento.replace(hour=HORA_HASTA, minute=0, second=0, microsecond=0)
-        return int(min((cierre - momento).total_seconds(), SONDEO_PUBLICO_MAX * 60))
 
     usados = consumo_del_mes(est, momento)
     reserva = COSTO_FUERA * 4 * dias_restantes(momento)  # corridas nocturnas y de fin de semana
@@ -524,9 +546,10 @@ def main():
                 # anota y se sigue sondeando, y recien al final se decide
                 fallas += 1
                 ultimo = e
-            if time.time() + PAUSA >= fin:
+            pausa = pausa_para(datetime.now(CHILE))
+            if time.time() + pausa >= fin:
                 break
-            time.sleep(PAUSA)
+            time.sleep(pausa)
     finally:
         anotar_consumo(est, inicio, time.time() - t0)
         guardar_estado(est)
