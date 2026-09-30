@@ -38,7 +38,7 @@ jobs:
           OFICINAS: PROVIDENCIA|LA FLORIDA
           PATRON: empalme
           MESES: '4'
-          PAUSA: '90'
+          PAUSA: '45'
           # para saber si el repo es publico (minutos gratis: vigilancia
           # continua) o privado (se reparte el presupuesto del mes)
           GH_TOKEN: ${{ github.token }}

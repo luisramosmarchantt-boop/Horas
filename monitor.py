@@ -73,14 +73,22 @@ COSTO_FUERA = int(os.environ.get("COSTO_FUERA", "90"))
 SONDEO_PUBLICO_MAX = int(os.environ.get("SONDEO_PUBLICO_MAX", "345"))
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 GH_REPO = os.environ.get("GH_REPO", "")
-# pausa entre pasadas dentro de una misma corrida
-PAUSA = int(os.environ.get("PAUSA", "90"))
+# pausa entre pasadas, de lunes a viernes en horario habil: los cupos se
+# liberan tambien por anulaciones, en la manana o en la tarde
+PAUSA = int(os.environ.get("PAUSA", "45"))
+# fines de semana de dia
+PAUSA_FINDE = int(os.environ.get("PAUSA_FINDE", "90"))
 # Enel publica la semana subsiguiente los lunes en la manana: en el ultimo mes
-# la semana nueva aparecio siempre entre las 09:34 y las 10:43, y cuando la
-# vimos ya estaba llena. En esa franja se revisa mas seguido.
-PAUSA_PUBLICACION = int(os.environ.get("PAUSA_PUBLICACION", "45"))
-PUBLICACION_DESDE = int(os.environ.get("PUBLICACION_DESDE", "9"))
+# la semana nueva aparecio siempre entre las 09:34 y las 10:43. En esa franja
+# cada pasada recorre el calendario entero para verla aparecer al tiro.
+PUBLICACION_DESDE = int(os.environ.get("PUBLICACION_DESDE", "8"))
 PUBLICACION_HASTA = int(os.environ.get("PUBLICACION_HASTA", "12"))
+# fuera de esa franja, el calendario entero se recorre cada tantos segundos;
+# entremedio solo se vuelven a mirar los dias ya publicados, que es donde
+# aparecen las anulaciones. Una pasada completa son ~110 consultas a Enel y
+# una rapida ~20: repetir las completas cada 45 s todo el dia arriesga que
+# Enel bloquee el acceso y el monitor quede ciego.
+REDESCUBRIR = int(os.environ.get("REDESCUBRIR", "300"))
 # de noche no se publica ni se agenda: se espacia para no cargar el sitio
 PAUSA_NOCHE = int(os.environ.get("PAUSA_NOCHE", "300"))
 # franja horaria chilena en que Enel carga y libera cupos
@@ -279,13 +287,16 @@ def etiqueta_dia(iso):
         return iso
 
 
-def revisar():
+def revisar(mapa=None):
     """Una pasada completa.
 
-    Devuelve (hallazgos, firma, publicados, dias_vistos), donde 'publicados' son
+    Devuelve (hallazgos, firma, publicados, dias_vistos, mapa), donde 'publicados' son
     todos los dias que Enel tiene con horario cargado, tengan cupo o no: que
     aparezca una semana nueva es la senal mas temprana que existe, porque los
     cupos se toman a las pocas horas de publicarse.
+
+    Con 'mapa' (lo que devolvio una pasada completa) hace una pasada rapida:
+    vuelve a mirar solo los dias ya publicados.
 
     Lanza SitioCambio si nada responde, para no confundir una caida con un
     "no hay horas".
@@ -297,51 +308,67 @@ def revisar():
     publicados = {}
     vistos = 0
 
-    for idof, nombre in oficinas(ab):
-        print("oficina:", nombre, "(id %s)" % idof)
-        for idserv, etiqueta in servicios(ab, idof):
-            dias = dias_publicados(ab, idserv, idof, hoy)
-            vistos += len(dias)
-            if not dias:
-                print("  %s -> sin ventana publicada" % etiqueta)
-                continue
+    if mapa is None:
+        # pasada completa: descubrir oficinas, tramites y ventanas publicadas
+        objetivos = []
+        for idof, nombre in oficinas(ab):
+            for idserv, etiqueta in servicios(ab, idof):
+                dias = dias_publicados(ab, idserv, idof, hoy)
+                objetivos.append((idof, nombre, idserv, etiqueta, sorted(dias)))
+        mapa = objetivos
+    else:
+        # pasada rapida: solo los dias ya conocidos; la portada entrega la
+        # sesion que la API necesita
+        traer(ab, PORTADA)
+        objetivos = [(o, n, s_, e, [f for f in fs if f >= hoy.isoformat()])
+                     for o, n, s_, e, fs in mapa]
 
-            for fecha in dias:
-                publicados["%s::%s::%s" % (idof, idserv, fecha)] = (nombre, etiqueta, fecha)
+    actual = None
+    for idof, nombre, idserv, etiqueta, dias in objetivos:
+        if idof != actual:
+            print("oficina:", nombre, "(id %s)" % idof)
+            actual = idof
+        vistos += len(dias)
+        if not dias:
+            print("  %s -> sin ventana publicada" % etiqueta)
+            continue
 
-            libres = {}
-            for fecha in sorted(dias):
-                horas, estado = horas_del_dia(ab, idserv, idof, fecha)
-                if horas:
-                    libres[fecha] = horas
-                elif estado == 0:
-                    # el sitio lo pinta seleccionable aunque no leamos franjas
-                    libres[fecha] = []
+        for fecha in dias:
+            publicados["%s::%s::%s" % (idof, idserv, fecha)] = (nombre, etiqueta, fecha)
 
-            print("  %s -> %s..%s (%d dias), %d con cupo"
-                  % (etiqueta, min(dias), max(dias), len(dias), len(libres)))
-            if not libres:
-                continue
+        libres = {}
+        for fecha in sorted(dias):
+            horas, estado = horas_del_dia(ab, idserv, idof, fecha)
+            if horas:
+                libres[fecha] = horas
+            elif estado == 0:
+                # el sitio lo pinta seleccionable aunque no leamos franjas
+                libres[fecha] = []
 
-            lineas = []
-            for fecha, horas in sorted(libres.items()):
-                if horas:
-                    extra = " (+%d mas)" % (len(horas) - 4) if len(horas) > 4 else ""
-                    lineas.append("  %s: %s%s"
-                                  % (etiqueta_dia(fecha), ", ".join(horas[:4]), extra))
-                else:
-                    lineas.append("  %s: dia habilitado" % etiqueta_dia(fecha))
-                print("    %s: %s" % (fecha, ", ".join(horas) or "sin detalle de horas"))
-            hallazgos.append("%s - %s\n%s" % (nombre, etiqueta, "\n".join(lineas)))
-            # la firma va por dia, no por hora: si alguien toma una hora suelta
-            # del mismo dia no tiene sentido volver a avisar de ese dia
-            marcas.extend("%s::%s::%s" % (idof, etiqueta, f) for f in sorted(libres))
+        print("  %s -> %s..%s (%d dias), %d con cupo"
+              % (etiqueta, min(dias), max(dias), len(dias), len(libres)))
+        if not libres:
+            continue
+
+        lineas = []
+        for fecha, horas in sorted(libres.items()):
+            if horas:
+                extra = " (+%d mas)" % (len(horas) - 4) if len(horas) > 4 else ""
+                lineas.append("  %s: %s%s"
+                              % (etiqueta_dia(fecha), ", ".join(horas[:4]), extra))
+            else:
+                lineas.append("  %s: dia habilitado" % etiqueta_dia(fecha))
+            print("    %s: %s" % (fecha, ", ".join(horas) or "sin detalle de horas"))
+        hallazgos.append("%s - %s\n%s" % (nombre, etiqueta, "\n".join(lineas)))
+        # la firma va por dia, no por hora: si alguien toma una hora suelta
+        # del mismo dia no tiene sentido volver a avisar de ese dia
+        marcas.extend("%s::%s::%s" % (idof, etiqueta, f) for f in sorted(libres))
 
     if vistos == 0:
         raise SitioCambio("ninguna oficina devolvio dias publicados; "
                           "el sitio o la API cambiaron")
 
-    return hallazgos, "|".join(sorted(marcas)), publicados, vistos
+    return hallazgos, "|".join(sorted(marcas)), publicados, vistos, mapa
 
 
 def avisar_publicados(est, publicados, t):
@@ -374,11 +401,23 @@ def avisar_publicados(est, publicados, t):
     return True
 
 
-def una_pasada(est):
-    """Revisa y avisa lo que corresponda. Devuelve True si mando algun aviso."""
+def una_pasada(est, cache=None):
+    """Revisa y avisa lo que corresponda. Devuelve True si mando algun aviso.
+
+    'cache' guarda entre pasadas de una misma corrida el mapa de dias
+    publicados, para alternar pasadas completas y rapidas."""
     t = time.time()
+    if cache is None:
+        cache = {}
+    completa = (not cache.get("mapa")
+                or t - cache.get("ts", 0) >= REDESCUBRIR
+                or en_publicacion(datetime.now(CHILE))
+                or not any(fs for *_, fs in cache["mapa"]))
     try:
-        hallazgos, firma, publicados, con_datos = revisar()
+        hallazgos, firma, publicados, con_datos, mapa = revisar(
+            None if completa else cache["mapa"])
+        if completa:
+            cache["mapa"], cache["ts"] = mapa, t
     except Exception as e:
         print("ERROR:", e, file=sys.stderr)
         if t - est.get("ts_error", 0) > REPETIR_ERROR:
@@ -435,11 +474,15 @@ def repo_publico():
 
 
 def pausa_para(momento):
-    if momento.weekday() == 0 and PUBLICACION_DESDE <= momento.hour < PUBLICACION_HASTA:
-        return PAUSA_PUBLICACION
     if not HORA_DESDE <= momento.hour < HORA_HASTA:
         return PAUSA_NOCHE
+    if momento.weekday() >= 5:
+        return PAUSA_FINDE
     return PAUSA
+
+
+def en_publicacion(momento):
+    return momento.weekday() == 0 and PUBLICACION_DESDE <= momento.hour < PUBLICACION_HASTA
 
 
 def en_horario(momento):
@@ -535,12 +578,13 @@ def main():
     pasada = 0
     fallas = 0
     ultimo = None
+    cache = {}
     try:
         while True:
             pasada += 1
             print("--- pasada %d ---" % pasada)
             try:
-                una_pasada(est)
+                una_pasada(est, cache)
             except Exception as e:
                 # una caida puntual no puede comerse el resto de la ventana: se
                 # anota y se sigue sondeando, y recien al final se decide
