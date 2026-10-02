@@ -34,6 +34,7 @@ Sobre ese endpoint hay tres cosas que conviene tener claras:
     en cada dia aparecian sus 10 franjas. La verdad esta en huecosLibres.
 """
 
+import http.client
 import http.cookiejar
 import json
 import os
@@ -99,6 +100,10 @@ HORA_HASTA = int(os.environ.get("HORA_HASTA", "19"))
 REPETIR_AVISO = 2 * 3600
 # cada cuanto avisar de una falla del monitor
 REPETIR_ERROR = 6 * 3600
+# cuanto tiempo seguido tiene que fallar antes de avisar: Enel corta alguna
+# conexion suelta de vez en cuando (1 de 123 pasadas el 02-10) y eso no
+# merece un aviso si la pasada siguiente sale bien
+AVISO_FALLA = int(os.environ.get("AVISO_FALLA", str(15 * 60)))
 # cada cuanto mandar el "sigo vivo"
 LATIDO = 24 * 3600
 
@@ -173,9 +178,11 @@ def traer(ab, url, reintentos=3):
                 if r.status != 200:
                     raise SitioCambio("%s respondio %s" % (url, r.status))
                 return r.read().decode("utf-8", "replace")
-        except urllib.error.URLError as e:
+        except (OSError, http.client.HTTPException) as e:
+            # URLError, timeouts y conexiones que Enel corta sin responder
+            # (RemoteDisconnected) son pasajeros: se reintenta
             ultimo = e
-            time.sleep(2 * (intento + 1))
+            time.sleep(3 * (intento + 1))
     raise SitioCambio("no pude leer %s: %s" % (url, ultimo))
 
 
@@ -420,15 +427,20 @@ def una_pasada(est, cache=None):
             cache["mapa"], cache["ts"] = mapa, t
     except Exception as e:
         print("ERROR:", e, file=sys.stderr)
-        if t - est.get("ts_error", 0) > REPETIR_ERROR:
-            avisar("PROBLEMA CON EL MONITOR DE ENEL\n(%s)\n\n%s\n\n"
+        desde = est.setdefault("falla_desde", t)
+        if t - desde >= AVISO_FALLA and t - est.get("ts_error", 0) > REPETIR_ERROR:
+            avisar("PROBLEMA CON EL MONITOR DE ENEL\n(%s)\n\nFalla desde hace %d min: %s\n\n"
                    "Mientras no se arregle, no puede avisarte de horas nuevas."
-                   % (ahora(), e))
+                   % (ahora(), (t - desde) // 60, e))
             est["ts_error"] = t
         guardar_estado(est)
         raise
 
+    if est.get("ts_error"):
+        avisar("Monitor de Enel recuperado (%s). Vuelvo a revisar normalmente."
+               % ahora())
     est["ts_error"] = 0
+    est.pop("falla_desde", None)
     aviso = avisar_publicados(est, publicados, t)
 
     if hallazgos:
