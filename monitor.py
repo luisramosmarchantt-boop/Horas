@@ -49,8 +49,9 @@ from zoneinfo import ZoneInfo
 
 BASE = os.environ.get("BASE", "https://servicequendalat.enel.com/citaprevia")
 PORTADA = BASE + "/?pais=cl"
-# los empalmes solo existen en Providencia y La Florida; se puede ampliar
-OFICINAS = os.environ.get("OFICINAS", os.environ.get("OFICINA", r"PROVIDENCIA|LA FLORIDA"))
+# solo Providencia (La Florida tambien tiene empalmes, pero no sirve). Es una
+# expresion regular: "PROVIDENCIA|LA FLORIDA" revisaria ambas
+OFICINAS = os.environ.get("OFICINAS", os.environ.get("OFICINA", r"PROVIDENCIA"))
 PATRON = os.environ.get("PATRON", r"empalme")
 MESES = int(os.environ.get("MESES", "4"))
 ESTADO = os.environ.get("ESTADO", "estado.json")

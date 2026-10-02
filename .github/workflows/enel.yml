@@ -35,7 +35,7 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          OFICINAS: PROVIDENCIA|LA FLORIDA
+          OFICINAS: PROVIDENCIA
           PATRON: empalme
           MESES: '4'
           PAUSA: '45'
